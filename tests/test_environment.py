@@ -27,27 +27,65 @@ IMAGE_REF = "hello-world@1"
 
 
 class Recorder:
-    """按 (method, 路径前缀) 匹配的 MockTransport + 请求记录。"""
+    """按 (method, 路径前缀) 匹配的 MockTransport + 请求记录。
 
-    def __init__(self, routes: dict[tuple[str, str], httpx.Response] | None = None) -> None:
+    exec 是个例外：同一路径上会跑语义完全不同的命令（`pwd` 探测、`mkdir`、
+    `cp -a` 搬运、`rm -rf` 清理），按路径路由区分不了 —— 故按**命令内容**分派，
+    并把每条命令记进 `commands` 供断言。
+    """
+
+    def __init__(
+        self,
+        routes: dict[tuple[str, str], httpx.Response] | None = None,
+        *,
+        root: str = "/app",
+        root_error: str | None = None,
+    ) -> None:
         self.routes = routes or {}
         self.requests: list[httpx.Request] = []
         self.bodies: list[dict] = []
+        self.commands: list[str] = []
+        self.root = root
+        # 非 None 时 pwd 探测失败（模拟 workdir 只读/不存在）。
+        self.root_error = root_error
 
     def handler(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        body: dict = {}
         if request.content:
             try:
-                self.bodies.append(json.loads(request.content))
+                body = json.loads(request.content)
             except (json.JSONDecodeError, UnicodeDecodeError):
-                self.bodies.append({})
+                body = {}
+            self.bodies.append(body)
+
+        # 显式路由优先（想让某条命令返回特定应答的用例仍能覆盖默认分派）。
         for (method, prefix), response in self.routes.items():
             if request.method == method and request.url.path.startswith(prefix):
                 return response
+        if request.method == "POST" and request.url.path.endswith("/exec"):
+            return self._exec(body.get("command", ""))
         return httpx.Response(404, json={"error": "not_found"})
+
+    def _exec(self, command: str) -> httpx.Response:
+        self.commands.append(command)
+        if "pwd" in command and self.root_error is not None:
+            return httpx.Response(200, json={
+                "exec_id": "e", "exit_code": 1, "stdout": "", "stderr": self.root_error,
+                "duration_ms": 1, "timed_out": False, "truncated": False,
+            })
+        if "pwd" in command:
+            return exec_ok(self.root + "\n")
+        return exec_ok()
 
     def paths(self, method: str) -> list[str]:
         return [r.url.path for r in self.requests if r.method == method]
+
+    def file_puts(self) -> list[str]:
+        return [p for p in self.paths("PUT") if "/files/" in p]
+
+    def cp_commands(self) -> list[str]:
+        return [c for c in self.commands if "cp -a" in c]
 
 
 def exec_ok(stdout: str = "") -> httpx.Response:
@@ -256,11 +294,12 @@ def test_sandbox_name_sanitized_and_bounded(tmp_path, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_upload_dir_mkdirs_first_then_uploads(tmp_path, monkeypatch):
-    """写文件不建父目录（guestd 只 O_CREATE）⇒ 先一次性 mkdir -p 再逐个写。"""
-    rec = Recorder({
-        ("POST", "/v1/sandboxes/sb-1/exec"): exec_ok(),
-        ("PUT", "/v1/sandboxes/sb-1/files"): httpx.Response(201, json={"path": "x", "size": 1}),
-    })
+    """写文件不建父目录（guestd 只 O_CREATE）⇒ 先一次性 mkdir -p 再逐个写。
+
+    注意落点：写入走**中转目录下的相对路径**（文件 API 只认 workdir 相对），
+    最后再一次性 `cp -a` 把内容并进真正的目标。
+    """
+    rec = Recorder({("PUT", "/v1/sandboxes/sb-1/files"): httpx.Response(201, json={"path": "x", "size": 1})})
     env = make_env(tmp_path, monkeypatch, rec)
     env._sandbox_id = "sb-1"
 
@@ -269,10 +308,183 @@ async def test_upload_dir_mkdirs_first_then_uploads(tmp_path, monkeypatch):
     (src / "Dockerfile").write_text("FROM x\n")
     (src / "tests" / "run.sh").write_text("echo hi\n")
 
-    await env.upload_dir(src, "/app")
+    await env.upload_dir(src, "/tests")
 
-    mkdir_body = next(b for b in rec.bodies if "mkdir" in str(b.get("command", "")))
-    assert "mkdir -p /app /app/tests" in mkdir_body["command"]
-    puts = rec.paths("PUT")
-    assert "sb-1/files/app/Dockerfile" in puts[0]
-    assert "sb-1/files/app/tests/run.sh" in puts[1]
+    mkdir_cmd = next(c for c in rec.commands if c.startswith("mkdir -p") and "rayrun-harbor-xfer" in c)
+    # 中转根目录下一个扁平子目录，含 tests/ 一层（父目录必须先建出来）
+    assert mkdir_cmd.startswith("mkdir -p .rayrun-harbor-xfer/")
+    assert mkdir_cmd.endswith("/tests")
+    puts = rec.file_puts()
+    assert puts[0].endswith("/files/.rayrun-harbor-xfer/" + mkdir_cmd.split("/")[1] + "/Dockerfile") or \
+        ".rayrun-harbor-xfer/" in puts[0]
+    assert puts[1].endswith("/tests/run.sh")
+    # 内容并进 /tests（`/.` 而不是把中转目录本身搬过去）
+    assert any(c.startswith("mkdir -p /tests && cp -a /app/.rayrun-harbor-xfer/") for c in rec.cp_commands())
+
+
+# ---------------------------------------------------------------- 路径根翻译
+#
+# Rayrun 的文件 API 是 **workdir 相对**的（`06` §4.5：绝对路径一律 400），
+# Harbor 用的却是容器绝对路径。这几条钉住两者的翻译 —— 走错了不会报错，
+# 只会把文件写到别处（或 400 掉整个 trial）。
+@pytest.mark.asyncio
+async def test_upload_file_stages_then_moves(tmp_path, monkeypatch):
+    """绝对目标 → 先写中转目录 → `cp -a` 到绝对路径（含父目录）。"""
+    rec = Recorder({("PUT", "/v1/sandboxes/sb-1/files"): httpx.Response(201, json={"path": "x", "size": 1})})
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    local = tmp_path / "test.sh"
+    local.write_text("echo hi\n")
+    await env.upload_file(local, "/tests/test.sh")
+
+    assert rec.file_puts()[0].startswith("/v1/sandboxes/sb-1/files/.rayrun-harbor-xfer/")
+    assert any(
+        c.startswith("mkdir -p /tests && cp -a /app/.rayrun-harbor-xfer/") and c.endswith(" /tests/test.sh")
+        for c in rec.cp_commands()
+    ), rec.commands
+
+
+@pytest.mark.asyncio
+async def test_download_file_stages_from_absolute(tmp_path, monkeypatch):
+    """绝对源 → 先 `cp -a` 进中转目录 → 再用相对路径读 → 清理。"""
+    rec = Recorder({
+        ("GET", "/v1/sandboxes/sb-1/files/"): httpx.Response(200, content=b"reward logs"),
+    })
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    target = tmp_path / "out" / "oracle.txt"
+    await env.download_file("/logs/agent/oracle.txt", target)
+
+    assert target.read_bytes() == b"reward logs"
+    assert any(c.endswith("&& cp -a /logs/agent/oracle.txt /app/.rayrun-harbor-xfer/" + c.split("/")[-1])
+               for c in rec.cp_commands()), rec.commands
+    # 中转目录必须被清掉（否则每笔传输都在任务的 workdir 里留垃圾）
+    assert any(c.startswith("rm -rf /app/.rayrun-harbor-xfer/") for c in rec.commands)
+
+
+@pytest.mark.asyncio
+async def test_download_dir_recurses_within_staged_root(tmp_path, monkeypatch):
+    """列目录是单层的 ⇒ 自己走递归，但递归的**根是中转目录**，不是 /logs。
+
+    轨迹里同名文件多，相对结构必须保住（拍平会互相覆盖）。
+    """
+    def tree(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("/exec"):
+            return exec_ok("/app\n")  # pwd 探测
+        # 列目录一律打在 /files?path=<…> 上（单层语义），读文件才走 /files/<path>。
+        if request.url.path.endswith("/files"):
+            listed = request.url.params.get("path", "")
+            assert listed.startswith(".rayrun-harbor-xfer/"), f"递归的根不是中转目录：{listed}"
+            if listed.count("/") == 1:  # 中转目录本身
+                return httpx.Response(200, json={"entries": [
+                    {"name": "sub", "type": "dir"},
+                    {"name": "top.txt", "type": "file", "size": 2},
+                ]})
+            return httpx.Response(200, json={"entries": [{"name": "deep.txt", "type": "file", "size": 2}]})
+        if "/files/" in request.url.path:
+            return httpx.Response(200, content=b"hi")
+        return httpx.Response(404, json={"error": "not_found"})
+
+    env = make_env(tmp_path, monkeypatch, Recorder())
+    # 构造之后再换：make_env 自己会 monkeypatch RayrunClient（覆盖上面这条），
+    # 而 client 是在 __init__ 里建的。
+    env._client = RayrunClient(BASE, "rayrun_test_secret", transport=httpx.MockTransport(tree))
+    env._sandbox_id = "sb-1"
+
+    target = tmp_path / "logs"
+    await env.download_dir("/logs/agent", target)
+
+    assert (target / "top.txt").read_bytes() == b"hi"
+    assert (target / "sub" / "deep.txt").read_bytes() == b"hi"
+
+
+@pytest.mark.asyncio
+async def test_relative_paths_pass_through_unchanged(tmp_path, monkeypatch):
+    """已经是相对路径的调用不该被再套一层中转（Harbor 也会传相对路径）。"""
+    rec = Recorder({("PUT", "/v1/sandboxes/sb-1/files"): httpx.Response(201, json={"path": "x", "size": 1})})
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    local = tmp_path / "f.txt"
+    local.write_text("x")
+    await env.upload_file(local, "rel/f.txt")
+
+    assert any(c.endswith(" rel/f.txt") for c in rec.cp_commands()), rec.commands
+
+
+@pytest.mark.asyncio
+async def test_readonly_workdir_error_is_actionable(tmp_path, monkeypatch):
+    """workdir 只读/不存在时，报错必须指向可照做的修法。
+
+    这正是 M4 首轮踩到的坑（`harbor-integration.md` §13.3）：镜像的 workdir
+    不在可写子树里，写文件只会以 io_error/EROFS 失败，而那个报错完全指不出
+    原因。探测放在第一次用到文件 API 时（pwd 与可写性同一趟）。
+    """
+    rec = Recorder(root_error="touch: cannot touch '.rayrun-writecheck': Read-only file system")
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    local = tmp_path / "f.txt"
+    local.write_text("x")
+    with pytest.raises(RuntimeError) as exc:
+        await env.upload_file(local, "/logs/f.txt")
+
+    message = str(exc.value)
+    assert "--writable-dir" in message
+    assert "Read-only file system" in message
+
+
+@pytest.mark.asyncio
+async def test_exec_without_timeout_is_not_server_truncated(tmp_path, monkeypatch):
+    """没给 timeout_sec 时必须**显式**传上限，不能落进 Rayrun 的 300s 服务端缺省。
+
+    Harbor 对 verifier 的时限是在外层用 asyncio.wait_for 兜的（docker provider 里
+    docker exec 无界），它不会把预算传进 exec。用服务端缺省 = 内层 300s 先杀，
+    外层 900s 的预算形同虚设 —— 症状是 verifier 跑到第 5 分钟断掉、Harbor 只报
+    「reward 文件不存在」。这条钉住「外层是唯一时限权威」。
+    """
+    rec = Recorder({("POST", "/v1/sandboxes/sb-1/exec"): exec_ok("ok")})
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    await env.exec("long-running-thing")            # 不给 timeout_sec
+    await env.exec("short", timeout_sec=30)         # 给了就照给
+
+    assert rec.bodies[0]["timeout_seconds"] == 3600
+    assert rec.bodies[1]["timeout_seconds"] == 30
+
+
+@pytest.mark.asyncio
+async def test_failed_download_cleans_staging(tmp_path, monkeypatch):
+    """源不存在（agent 什么都没写）时也要收摊 —— 否则每跑一次 trial 就在任务
+    workdir 里留一个空目录，跑一百次就有一百个。
+
+    这条不是异常路径上的边角：Harbor 每次都会 `download_dir("/logs/agent")`。
+    """
+    rec = Recorder()
+
+    def failing_exec(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        cmd = body.get("command", "")
+        if "cp -a" in cmd:
+            rec.commands.append(cmd)
+            return httpx.Response(200, json={
+                "exec_id": "e", "exit_code": 1, "stdout": "",
+                "stderr": "cp: cannot stat '/logs/agent': No such file or directory",
+                "duration_ms": 1, "timed_out": False, "truncated": False,
+            })
+        return rec._exec(cmd)
+
+    # 构造之后再换 client：make_env 自己会 monkeypatch RayrunClient（覆盖上面那条）。
+    env = make_env(tmp_path, monkeypatch, Recorder())
+    env._client = RayrunClient(BASE, "tok", transport=httpx.MockTransport(failing_exec))
+    env._sandbox_id = "sb-1"
+
+    with pytest.raises(Exception) as exc:
+        await env.download_dir("/logs/agent", tmp_path / "out")
+    assert "No such file or directory" in str(exc.value)
+
+    # 清理命令发出去了（且指向中转目录）
+    assert any(c.startswith("rm -rf /app/.rayrun-harbor-xfer/") for c in rec.commands), rec.commands

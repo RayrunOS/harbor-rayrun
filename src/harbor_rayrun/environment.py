@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import os
 import shlex
+import uuid
 from pathlib import Path, PurePosixPath
 from typing import override
 
@@ -49,7 +50,7 @@ from harbor.environments.definition import (
     require_agent_environment_definition,
 )
 from harbor.models.task.config import EnvironmentConfig, NetworkMode, NetworkPolicy
-from harbor.models.trial.paths import TrialPaths
+from harbor.models.trial.paths import EnvironmentPaths, TrialPaths
 
 from harbor_rayrun.client import RayrunClient
 
@@ -68,8 +69,38 @@ DEFAULT_MEMORY_MB = 2048
 # 命令超时给 Harbor 的退出码：照 timeout(1) 惯例，与 Rayrun CLI 同口径（`07` §2.4）。
 EXIT_CODE_TIMEOUT = 124
 
+# 调用方没给 timeout_sec 时用的命令超时 = Rayrun exec 的上限（`06` §4.4.1）。
+#
+# 为什么不是「不传，让服务端用缺省」：Rayrun 的 exec **有**服务端缺省 300s，而
+# Harbor 对 verifier 的时限是在**外层**用 asyncio.wait_for 兜的（docker provider
+# 里 docker exec 本身无界）。照缺省走会让「外层给 900s、内层 300s 就杀」的截断
+# 静默发生 —— 表现是 verifier 跑到第 5 分钟被打断、Harbor 只报 reward 文件不存在
+#（2026-09-27 M4 实测踩到，`docs/plans/harbor-integration.md` §13.6）。
+# 取上限 ⇒ **外层成为唯一时限权威**，语义与 docker provider 对齐。
+DEFAULT_EXEC_TIMEOUT_SEC = 3600
+
 # 沙箱名上限（`06` §4.3：同客户内活跃沙箱名唯一，≤ 64 字符）。
 MAX_SANDBOX_NAME = 64
+
+# 文件传输的中转目录（相对 workdir）。文件 API 只认 workdir 相对路径，Harbor
+# 的路径全在 workdir 之外，所以每笔传输都要在此落一次脚。点号开头 + 每笔一个
+# 随机子目录：与任务自己的文件不会撞名，也不会被任务的 `ls` 当成它的产物。
+STAGING_DIR = ".rayrun-harbor-xfer"
+
+# Harbor 约定的落盘路径（**从它的 EnvironmentPaths 派生**，不在这里抄一份 ——
+# Harbor 改目录时这里跟着走）。它们在 workdir 之外，而沙箱里清单外的目录一律
+# 只读（ADR-006 的 overlay 只覆盖固定的 7 个子树）⇒ 任务镜像必须把这三个目录
+# 声明为可写，否则 verifier 连 `/logs/verifier/reward.txt` 都写不出来。
+_HARBOR_PATHS = EnvironmentPaths()
+HONORED_WRITABLE_DIRS: tuple[str, ...] = (
+    str(_HARBOR_PATHS.logs_dir),
+    str(_HARBOR_PATHS.tests_dir),
+    str(_HARBOR_PATHS.solution_dir),
+)
+WRITABLE_HINT = (
+    "  ⚠ --writable-dir 是**必需**的（不是可选优化）：这几个目录在沙箱里默认只读，"
+    "详见 docs/plans/harbor-integration.md §13.3"
+)
 
 
 class RayrunEnvironment(BaseEnvironment):
@@ -112,6 +143,8 @@ class RayrunEnvironment(BaseEnvironment):
             token=self._require_env(ENV_TOKEN),
         )
         self._sandbox_id: str | None = None
+        # 文件 API 的根（= manifest workdir），首次用到时问 guest 一次。
+        self._root: str | None = None
 
     # ------------------------------------------------------------ 契约面
     @staticmethod
@@ -248,7 +281,7 @@ class RayrunEnvironment(BaseEnvironment):
             command,
             cwd=cwd,
             env=self._merge_env(env),
-            timeout_seconds=timeout_sec,
+            timeout_seconds=timeout_sec or DEFAULT_EXEC_TIMEOUT_SEC,
             user="root",
         )
         # 超时：Rayrun 契约里 exit_code 为 null（不伪造 128+9），这里给 Harbor 一个
@@ -261,13 +294,29 @@ class RayrunEnvironment(BaseEnvironment):
         return ExecResult(stdout=result.stdout, stderr=result.stderr, return_code=return_code)
 
     # ------------------------------------------------------------ 文件
+    #
+    # **路径根**：Rayrun 的文件 API 是 **workdir 相对**的（`06` §4.5 —— 绝对路径
+    # 与 `..` 逃逸一律 400 `invalid_path` 并落审计，那是有意的安全边界），而
+    # Harbor 用的是**容器绝对路径**（`EnvironmentPaths` 把 `/logs` `/tests`
+    # `/solution` 写死在里面）。两者之间必须翻译，否则上传/下载全部 400。
+    #
+    # 翻译以「中转目录」收口：先把目标用 `cp -a` 挪进 workdir 下的中转目录，
+    # 再用文件 API 读写，完事删掉。**刻意不做「本来就在 workdir 里就直通」的
+    # 优化** —— Harbor 传给文件 API 的路径全都落在 workdir 之外（它自己的三个
+    # 目录），优化出来的分支在真实调用上一次都不会跑，却要多养一条路径。
+    # 代价是每次传输多一次 guest 内 `cp`（本地盘，与跨网传输不是一个量级）。
     @override
     async def upload_file(self, source_path: Path | str, target_path: str) -> None:
         sandbox_id = self._require_sandbox()
-        # guestd 写文件不建父目录（file_ops.go 只 O_CREATE），父目录要自己保证。
-        await self._ensure_parent_dir(target_path)
-        with open(source_path, "rb") as fh:
-            await self._client.write_file_stream(sandbox_id, target_path, fh)
+        rel = await self._stage_out()
+        try:
+            with open(source_path, "rb") as fh:
+                # guestd 写文件不建父目录（file_ops.go 只 O_CREATE）—— 中转目录
+                # 已由 _stage_out 建好，文件名是扁平的，不需要再建父目录。
+                await self._client.write_file_stream(sandbox_id, rel, fh)
+            await self._move(rel, target_path)
+        finally:
+            await self._unstage(rel)
 
     @override
     async def upload_dir(self, source_dir: Path | str, target_dir: str) -> None:
@@ -276,20 +325,35 @@ class RayrunEnvironment(BaseEnvironment):
         files = [p for p in sorted(root.rglob("*")) if p.is_file()]
         if not files:
             return
-        # 一次性把所有需要的目录建出来：guestd 的写文件不建父目录，逐个文件一次
-        # exec 会慢得多（一个 environment/ 目录可能有几十上百个文件）。
-        dirs = sorted(
-            {str(PurePosixPath(target_dir) / p.relative_to(root).parent) for p in files}
-        )
-        await self._mkdirs(sandbox_id, dirs)
-        for path in files:
-            rel = path.relative_to(root)
-            await self.upload_file(path, str(PurePosixPath(target_dir) / rel))
+        rel = await self._stage_out()
+        try:
+            # 一次性把所有需要的目录建出来：guestd 的写文件不建父目录，逐个文件
+            # 一次 exec 会慢得多（一个 environment/ 目录可能有几十上百个文件）。
+            # 这些是**相对路径** —— exec 的缺省 cwd 就是 workdir，正好对上。
+            dirs = sorted({str(PurePosixPath(rel) / p.relative_to(root).parent) for p in files})
+            await self._mkdirs(sandbox_id, dirs)
+            for path in files:
+                sub = path.relative_to(root)
+                with open(path, "rb") as fh:
+                    await self._client.write_file_stream(sandbox_id, f"{rel}/{sub}", fh)
+            # 内容**并进**目标目录（不是把中转目录本身搬过去）：Harbor 对
+            # upload_dir 的语义是「把 source 的内容放到 target」。
+            guest_root = await self._file_root()
+            await self._run(
+                f"mkdir -p {shlex.quote(target_dir)} && "
+                f"cp -a {guest_root}/{rel}/. {shlex.quote(target_dir)}/"
+            )
+        finally:
+            await self._unstage(rel)
 
     @override
     async def download_file(self, source_path: str, target_path: Path | str) -> None:
         sandbox_id = self._require_sandbox()
-        data = await self._client.read_file(sandbox_id, source_path)
+        rel = await self._stage_in(source_path)
+        try:
+            data = await self._client.read_file(sandbox_id, rel)
+        finally:
+            await self._unstage(rel)
         local = Path(target_path)
         local.parent.mkdir(parents=True, exist_ok=True)
         local.write_bytes(data)
@@ -297,21 +361,92 @@ class RayrunEnvironment(BaseEnvironment):
     @override
     async def download_dir(self, source_dir: str, target_dir: Path | str) -> None:
         sandbox_id = self._require_sandbox()
-        local_root = Path(target_dir)
-        src_root = PurePosixPath(source_dir)
-        # 列目录是**单层**的（`12` §4.2：无递归语义）⇒ 自己走一遍广度优先，
-        # 并保留相对目录结构（轨迹里同名文件多，拍平会互相覆盖）。
-        queue = [src_root]
-        while queue:
-            current = queue.pop(0)
-            for entry in await self._client.list_files(sandbox_id, str(current)):
-                remote = current / entry["name"]
-                if entry.get("type") == "dir":
-                    queue.append(remote)
-                    continue
-                local_path = local_root / remote.relative_to(src_root)
-                local_path.parent.mkdir(parents=True, exist_ok=True)
-                local_path.write_bytes(await self._client.read_file(sandbox_id, str(remote)))
+        rel = await self._stage_in(source_dir)
+        try:
+            local_root = Path(target_dir)
+            src_root = PurePosixPath(rel)
+            # 列目录是**单层**的（`12` §4.2：无递归语义）⇒ 自己走一遍广度优先，
+            # 并保留相对目录结构（轨迹里同名文件多，拍平会互相覆盖）。
+            queue = [src_root]
+            while queue:
+                current = queue.pop(0)
+                for entry in await self._client.list_files(sandbox_id, str(current)):
+                    remote = current / entry["name"]
+                    if entry.get("type") == "dir":
+                        queue.append(remote)
+                        continue
+                    local_path = local_root / remote.relative_to(src_root)
+                    local_path.parent.mkdir(parents=True, exist_ok=True)
+                    local_path.write_bytes(await self._client.read_file(sandbox_id, str(remote)))
+        finally:
+            await self._unstage(rel)
+
+    # ---- 路径翻译（中转目录） ----------------------------------------
+    async def _file_root(self) -> str:
+        """文件 API 的根 = manifest `[run].workdir`（`06` §4.5）。
+
+        用 `pwd` 问 guest 而不是读 manifest：manifest 不过 HTTP，provider 侧拿
+        不到；而 exec 的缺省 cwd 恰好就是 workdir（`10` §3.9），问一次即可，
+        不需要为 provider 新增接口。顺带在同一趟里验证**它可写** —— 写不了的话
+        每次传输都会以 `io_error` 失败，而那个报错完全指不出「镜像的 workdir
+        只读，要用 --writable-dir 重建」（`docs/plans/harbor-integration.md` §13.3）。
+        """
+        if self._root is None:
+            # 刻意不经 _run：它的通用报错指不出这里该给的那条修法。
+            result = await self._client.exec(
+                self._require_sandbox(),
+                "touch .rayrun-writecheck && rm -f .rayrun-writecheck && pwd",
+                timeout_seconds=60,
+                user="root",
+            )
+            root = result.stdout.strip()
+            if result.exit_code != 0 or not root.startswith("/"):
+                raise RuntimeError(
+                    f"沙箱 workdir 不可写或不可用（exit={result.exit_code}）：{result.stderr.strip()[:200]}\n"
+                    "  任务镜像的 workdir 若不在默认可写的子树里（/usr /etc /var /opt /root /home /srv），"
+                    "重建镜像时要声明：\n"
+                    "    images/build-task-image.sh … --writable-dir <workdir>\n"
+                    "  见 docs/plans/harbor-integration.md §13.3 与 ADR-006 修订。"
+                )
+            self._root = root
+        return self._root
+
+    async def _stage_in(self, source: str) -> str:
+        """把 guest 内的绝对路径（文件或目录）复制进 workdir 下的中转目录，
+        返回**相对路径**（可直接喂文件 API）。调用方负责 `_unstage`。
+
+        复制失败（比如源目录不存在）时**在这里**收摊再抛：调用方的 finally 拿不到
+        返回值，谁都不会替它清 —— 而这**不是**异常路径上的边角情况，
+        `download_dir("/logs/agent")`（agent 一个字都没写时）每次都会走到。
+        """
+        rel = await self._stage_out()
+        root = await self._file_root()
+        try:
+            await self._run(f"rm -rf {root}/{rel} && cp -a {shlex.quote(source)} {root}/{rel}")
+        except Exception:
+            try:
+                await self._unstage(rel)
+            except Exception:  # noqa: BLE001 —— 清理失败不能盖掉原始错误
+                pass
+            raise
+        return rel
+
+    async def _stage_out(self) -> str:
+        """分配一个空的、位于 workdir 下的中转相对路径。"""
+        root = await self._file_root()
+        rel = f"{STAGING_DIR}/{uuid.uuid4().hex[:12]}"
+        await self._run(f"rm -rf {root}/{rel} && mkdir -p {root}/{rel}")
+        return rel
+
+    async def _unstage(self, rel: str) -> None:
+        await self._run(f"rm -rf {await self._file_root()}/{rel}")
+
+    async def _move(self, rel: str, target: str) -> None:
+        """把中转路径搬到 guest 内的绝对目标（含父目录）。"""
+        root = await self._file_root()
+        parent = str(PurePosixPath(target).parent)
+        mkdir = f"mkdir -p {shlex.quote(parent)} && " if parent not in ("", ".") else ""
+        await self._run(f"{mkdir}cp -a {root}/{rel} {shlex.quote(target)}")
 
     # ------------------------------------------------------------ 内部
     @staticmethod
@@ -325,6 +460,17 @@ class RayrunEnvironment(BaseEnvironment):
         if self._sandbox_id is None:
             raise RuntimeError("沙箱尚未启动（先 start()）")
         return self._sandbox_id
+
+    async def _run(self, command: str, timeout_sec: int = 120):
+        """跑一条 guest 内命令，非 0 退出即抛（中转目录的搬运全部经这里）。"""
+        result = await self._client.exec(
+            self._require_sandbox(), command, timeout_seconds=timeout_sec, user="root"
+        )
+        if result.exit_code != 0:
+            raise RuntimeError(
+                f"guest 命令失败（exit={result.exit_code}）：{command[:120]}\n  {result.stderr.strip()[:200]}"
+            )
+        return result
 
     def _image_ref(self) -> str:
         prefix = os.environ.get(ENV_IMAGE_PREFIX, "")
@@ -366,12 +512,21 @@ class RayrunEnvironment(BaseEnvironment):
             return
         name, _, version = image_ref.partition("@")
         available = "、".join(sorted(existing)) or "（宿主机镜像目录为空）"
+        # 镜像里的 source 两种形态都要能照做：Dockerfile（本地可构建）与
+        # docker_image（预构建，任务只给了引用）。
+        source = (
+            f"--image {shlex.quote(self.task_env_config.docker_image)}"
+            if self.task_env_config.docker_image
+            else f"--dockerfile {self.environment_dir}/Dockerfile"
+        )
         raise ValueError(
             f"Rayrun 宿主机上没有镜像 {image_ref}。\n"
             "  在**有 docker 的构建机**上产一张（离线 builder，见 docs/plans/harbor-integration.md §10）：\n"
-            f"    images/build-task-image.sh --dockerfile {self.environment_dir}/Dockerfile \\\n"
-            f"        --name {name} --version {version or '1'} --out /tmp/task-images\n"
+            f"    images/build-task-image.sh {source} \\\n"
+            f"        --name {name} --version {version or '1'} --out /tmp/task-images \\\n"
+            f"        {' '.join(f'--writable-dir {d}' for d in HONORED_WRITABLE_DIRS)}\n"
             f"    rsync -a --sparse /tmp/task-images/{image_ref}/ <宿主机>:$RAYRUN_IMAGES_DIR/\n"
+            f"  {WRITABLE_HINT}\n"
             f"  宿主机现有镜像：{available}"
         )
 
@@ -380,9 +535,3 @@ class RayrunEnvironment(BaseEnvironment):
         result = await self._client.exec(sandbox_id, f"mkdir -p {quoted}", timeout_seconds=60)
         if result.exit_code != 0:
             raise RuntimeError(f"mkdir -p 失败（exit={result.exit_code}）：{result.stderr[:200]}")
-
-    async def _ensure_parent_dir(self, target_path: str) -> None:
-        parent = str(PurePosixPath(target_path).parent)
-        if parent in ("", "."):
-            return
-        await self._mkdirs(self._require_sandbox(), [parent])

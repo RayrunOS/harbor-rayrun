@@ -43,6 +43,22 @@ harbor run -t <task> -a oracle -e harbor_rayrun:RayrunEnvironment
 Dockerfile 是明确不做的（RCE 面）。镜像缺失时 `start()` 会直接报错并附一条**可直接复制**的
 构建命令，不猜、不静默。
 
+**构建时必须带上三个 `--writable-dir`**：
+
+```bash
+images/build-task-image.sh --dockerfile <任务的 Dockerfile> \
+    --name <name> --version 1 --out /tmp/task-images \
+    --writable-dir /logs --writable-dir /tests --writable-dir /solution
+```
+
+这不是可选优化。沙箱里**清单外的目录一律只读**（ADR-006：可写面是固定 7 个子树
+`/usr /etc /var /opt /root /home /srv` + `/workspace` 盘），而 Harbor 的
+`/logs`（reward 写在这里）`/tests` `/solution` 全在清单外 ⇒ 少了它们，verifier 连
+`/logs/verifier/reward.txt` 都写不出来，症状只是「reward 文件不存在」。同一原因，
+任务镜像自己的 `WORKDIR`（典型 `/app`）也要可写 —— 那一条由 guestd 按 manifest 的
+`[run].workdir` **自动**补挂，不需要在命令行重复声明。见 `docs/plans/harbor-integration.md`
+§13.3 与 ADR-006 修订。
+
 **2. 网络策略的映射是精确的**（2026-09-27 起）：
 
 | Harbor `NetworkPolicy` | Rayrun `egress` |
