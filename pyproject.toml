@@ -1,0 +1,28 @@
+[project]
+name = "harbor-rayrun"
+version = "0.1.0"
+description = "Harbor provider：把 Rayrun 沙箱云接成 Harbor 的评测环境（docs/plans/harbor-integration.md M3）"
+readme = "README.md"
+requires-python = ">=3.12"
+# 依赖只有两个：Harbor 本体（提供 BaseEnvironment 抽象面）与 httpx（打 Rayrun 的
+# HTTP API）。**刻意不引 Rayrun 的生成式 SDK** —— provider 只用 8 个端点，薄客户端
+# 足够，且 SDK 生成是独立立项（15 §10-Q7）。将来若 SDK 落地，换掉 client.py 即可，
+# provider 的契约不变。
+dependencies = [
+    "harbor>=0.23.0,<0.24",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8", "pytest-asyncio>=0.24"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/harbor_rayrun"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
