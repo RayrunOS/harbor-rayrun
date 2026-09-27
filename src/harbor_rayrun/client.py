@@ -139,21 +139,28 @@ class RayrunClient:
         agent: str,
         cpu_cores: int,
         memory_mb: int,
-        egress_allow: list[str],
+        egress_allow: list[str] | None = None,
+        egress_allow_all: bool = False,
         workspace_mb: int | None = None,
         max_lifetime_seconds: int | None = None,
     ) -> Sandbox:
         """`POST /v1/sandboxes`（201 = 已 Running，同步端点，`06` §4.3）。
 
-        `egress_allow=[]` 即**完全断网** —— Rayrun 不存在「允许全部」档位
-        （`06` §4.3），调用方必须按 Harbor 的 NetworkPolicy 精确给出名单。
+        `egress_allow=[]` 即**完全断网**；`egress_allow_all=True` 是显式的「允许
+        全部出网」（2026-09-27 起，`06` §4.3）—— 两者**互斥**，同时给会被 daemon
+        以 400 拒绝（这里也不构造那种请求）。
         """
+        if egress_allow_all and egress_allow:
+            raise ValueError("egress_allow_all 与 egress_allow 互斥（daemon 会 400）")
+        egress: dict = {"allow": list(egress_allow or [])}
+        if egress_allow_all:
+            egress["allow_all"] = True
         body: dict = {
             "name": name,
             "agent": agent,
             "cpu_cores": cpu_cores,
             "memory_mb": memory_mb,
-            "egress": {"allow": egress_allow},
+            "egress": egress,
         }
         if workspace_mb is not None:
             body["workspace_mb"] = workspace_mb

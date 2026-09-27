@@ -121,19 +121,23 @@ def test_type_is_rayrun(tmp_path, monkeypatch):
 
 # ---------------------------------------------------------------- 网络策略
 @pytest.mark.asyncio
-async def test_start_rejects_public_network_before_creating_sandbox(tmp_path, monkeypatch):
-    """PUBLIC 明确拒绝，且**不建 VM**（先算 egress 再建）。
+async def test_public_network_maps_to_allow_all(tmp_path, monkeypatch):
+    """PUBLIC → Rayrun 的显式「允许全部出网」档位（`egress.allow_all=true`）。
 
-    Rayrun 没有「允许全部出网」档位；静默降级成断网会让任务莫名失败。
+    Harbor 的 NetworkPolicy 默认就是 PUBLIC，所以这条映射决定了默认任务能不能跑；
+    它必须是**精确执行**（不是静默近似成断网或一串枚举）。
     """
-    rec = Recorder({("GET", "/v1/agents"): httpx.Response(200, json={"agents": []})})
-    env = make_env(tmp_path, monkeypatch, rec)  # 默认 policy 就是 PUBLIC
+    rec = Recorder({
+        ("GET", "/v1/agents"): httpx.Response(200, json={"agents": [{"name": "hello-world", "version": "1"}]}),
+        ("POST", "/v1/sandboxes"): httpx.Response(201, json={"id": "sb-1", "status": "Running"}),
+        ("POST", "/v1/sandboxes/sb-1/exec"): exec_ok(),
+    })
+    env = make_env(tmp_path, monkeypatch, rec)  # 默认 policy = PUBLIC
 
-    with pytest.raises(ValueError) as exc:
-        await env.start(force_build=False)
+    await env.start(force_build=False)
 
-    assert "allowlist" in str(exc.value)
-    assert rec.paths("POST") == []          # 关键：没有白建沙箱
+    create = next(b for b in rec.bodies if "agent" in b)
+    assert create["egress"] == {"allow": [], "allow_all": True}
 
 
 @pytest.mark.asyncio

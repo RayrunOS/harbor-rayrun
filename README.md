@@ -43,19 +43,17 @@ harbor run -t <task> -a oracle -e harbor_rayrun:RayrunEnvironment
 Dockerfile 是明确不做的（RCE 面）。镜像缺失时 `start()` 会直接报错并附一条**可直接复制**的
 构建命令，不猜、不静默。
 
-**2. 任务不能是「PUBLIC 出网」。** Rayrun 的 egress 是**精确白名单**模型，没有「允许全部」
-档位（`docs/06` §4.3）；而 Harbor 的 `NetworkPolicy` 默认是 `PUBLIC` ⇒ 这类任务会在建沙箱
-**之前**被明确拒绝（绝不静默降级成断网，那会让任务莫名失败）。任务需声明：
+**2. 网络策略的映射是精确的**（2026-09-27 起）：
 
-```toml
-[environment]
-network_mode = "allowlist"
-allowed_hosts = ["pypi.org", "files.pythonhosted.org"]   # 按任务所需
-# 或 network_mode = "no-network"
-```
+| Harbor `NetworkPolicy` | Rayrun `egress` |
+|---|---|
+| `no-network` | `allow: []`（完全断网） |
+| `allowlist` | `allow: [...]`（域名精确匹配 + IPv4 CIDR） |
+| `public`（**Harbor 的默认**） | `allow_all: true`（显式档位，Rayrun 侧会进审计） |
 
-⚠️ Harbor 对 `PUBLIC` 没有能力位可拦（能力位只覆盖「能不能断网/能不能白名单」），所以这道闸
-必须在 provider 里 —— 它是**产品缺口**的诚实表达，见 `docs/plans/harbor-integration.md` §11。
+三者都**精确执行**、不做静默近似。`public` 那一档曾经只能被拒绝（Rayrun 当时没有「允许
+全部」），为此产品侧补了 `egress.allow_all`（`06` §4.3）—— 于是默认任务也能跑，而「这台
+沙箱开了全出网」在 Rayrun 的 journal（`sandbox.created.payload.egress.allow_all`）里看得见。
 
 ## 依赖
 

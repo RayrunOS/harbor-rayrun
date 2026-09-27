@@ -181,7 +181,7 @@ class RayrunEnvironment(BaseEnvironment):
         if self._sandbox_id is not None:
             raise RuntimeError(f"环境已启动（sandbox={self._sandbox_id}），不要重复 start")
 
-        egress_allow = self._egress_allow()
+        egress_allow, egress_allow_all = self._egress()
         image_ref = self._image_ref()
         await self._require_image(image_ref)
 
@@ -198,6 +198,7 @@ class RayrunEnvironment(BaseEnvironment):
             cpu_cores=int(cpus),
             memory_mb=int(memory_mb),
             egress_allow=egress_allow,
+            egress_allow_all=egress_allow_all,
         )
         self._sandbox_id = sandbox.id
         self.logger.debug(
@@ -205,7 +206,7 @@ class RayrunEnvironment(BaseEnvironment):
             sandbox.id,
             image_ref,
             sandbox.ip,
-            egress_allow or "[]（断网）",
+            "allow_all" if egress_allow_all else (egress_allow or "[]（断网）"),
         )
 
         # 基类助手：建挂载点目录（走我们实现的 exec）；「预构建镜像」类任务还会把
@@ -339,25 +340,23 @@ class RayrunEnvironment(BaseEnvironment):
         safe = "".join(c if (c.isalnum() or c in "._-") else "-" for c in self.session_id)
         return safe[:MAX_SANDBOX_NAME] or "harbor-trial"
 
-    def _egress_allow(self) -> list[str]:
-        """把 Harbor 的 NetworkPolicy 映射成 Rayrun 的 `egress.allow`。
+    def _egress(self) -> tuple[list[str], bool]:
+        """把 Harbor 的 NetworkPolicy 映射成 Rayrun 的 `egress`（`06` §4.3）。
 
-        **PUBLIC 明确拒绝**：Rayrun 没有「允许全部出网」档位（`06` §4.3）—— 近似成
-        断网会让任务莫名失败，近似成白名单又无法枚举「全部」。
+        - `no-network` → `allow=[]`（完全断网）
+        - `allowlist`  → `allow=[...]`
+        - `public`     → **`allow_all=true`**（显式档位，2026-09-27 起）。
+
+        三种模式都**精确执行**，不做任何静默近似 —— 早先 Rayrun 没有「允许全部」
+        档位时，PUBLIC 只能被拒绝；补上那一档之后，Harbor 的默认策略（PUBLIC）
+        才真正跑得起来，且「这台沙箱开了全出网」在 Rayrun 的审计里看得见。
         """
         policy: NetworkPolicy = self.network_policy
         if policy.network_mode == NetworkMode.NO_NETWORK:
-            return []
+            return [], False
         if policy.network_mode == NetworkMode.PUBLIC:
-            raise ValueError(
-                "Rayrun 不支持 PUBLIC 出网（没有「允许全部」档位，egress 是精确白名单模型，docs/06 §4.3）。\n"
-                "  请给任务声明受限的网络策略：\n"
-                "    [environment]\n"
-                '    network_mode = "allowlist"\n'
-                '    allowed_hosts = ["pypi.org", "files.pythonhosted.org"]   # 按任务所需\n'
-                '  或 network_mode = "no-network"。'
-            )
-        return sorted(set(policy.allowed_hosts))
+            return [], True
+        return sorted(set(policy.allowed_hosts)), False
 
     async def _require_image(self, image_ref: str) -> None:
         """镜像必须已在 Rayrun 宿主机上（Rayrun 不做镜像构建，见类文档第 4 条）。"""
