@@ -439,11 +439,20 @@ class RayrunEnvironment(BaseEnvironment):
         return rel
 
     async def _stage_out(self) -> str:
-        """分配一个空的、位于 workdir 下的中转相对路径。"""
+        """分配一个空的、位于 workdir 下的中转相对路径。
+
+        **只建父目录**（`STAGING_DIR` 本身），返回的路径**刻意保持不存在** ——
+        中转路径是什么形状由调用方决定：`upload_file` 要在它上面放一个**文件**，
+        而 guestd 的写文件是 `O_CREATE|O_TRUNC|O_WRONLY`
+        （`guestd/internal/guest/file_ops.go:43`），往一个已存在的**目录**上写会
+        `EISDIR` ⇒ 500 `file op io_error`。`upload_dir` / `_stage_in` 要的是目录，
+        它们自己会 `mkdir -p`（前者经 `_mkdirs` 一次性建齐，后者靠 `cp -a` 顺带建）。
+
+        名字带 uuid ⇒ 不会撞上上一轮遗留的中转路径，不需要先 `rm -rf`。
+        """
         root = await self._file_root()
-        rel = f"{STAGING_DIR}/{uuid.uuid4().hex[:12]}"
-        await self._run(f"rm -rf {root}/{rel} && mkdir -p {root}/{rel}")
-        return rel
+        await self._run(f"mkdir -p {root}/{STAGING_DIR}")
+        return f"{STAGING_DIR}/{uuid.uuid4().hex[:12]}"
 
     async def _unstage(self, rel: str) -> None:
         await self._run(f"rm -rf {await self._file_root()}/{rel}")

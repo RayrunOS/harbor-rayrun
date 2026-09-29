@@ -21,6 +21,7 @@ from harbor.models.trial.paths import TrialPaths
 
 from harbor_rayrun import RayrunEnvironment
 from harbor_rayrun.client import RayrunClient
+from harbor_rayrun.environment import STAGING_DIR
 
 BASE = "http://rayrun.test/v1"
 IMAGE_REF = "hello-world@1"
@@ -48,6 +49,11 @@ class Recorder:
         # provider 用 argv 形式发 exec（`["bash","-c",command]`）：`commands` 记
         # **内层命令文本**，好让断言停在「命令内容」这一层；包壳形状记在这里。
         self.argv_bodies: list[list[str] | None] = []
+        # guest 里被 `mkdir -p` 建出来的工作dir 相对路径。写文件**不会**报
+        # 「这是目录」——它只 O_CREATE（guestd/internal/guest/file_ops.go:43），
+        # 撞上目录时 guest 侧是 EISDIR ⇒ 500 file op io_error。这里把这层约束
+        # 建模出来，否则「中转路径被预建成目录」这类缺陷在单测里完全隐形。
+        self.dirs: set[str] = set()
         self.root = root
         # 非 None 时 pwd 探测失败（模拟 workdir 只读/不存在）。
         self.root_error = root_error
@@ -68,6 +74,13 @@ class Recorder:
                 return response
         if request.method == "POST" and request.url.path.endswith("/exec"):
             return self._exec(body)
+        if request.method == "PUT" and "/files/" in request.url.path:
+            rel = request.url.path.split("/files/", 1)[1]
+            if rel in self.dirs:
+                return httpx.Response(
+                    500, json={"error": "internal_error", "message": "file op io_error"}
+                )
+            return httpx.Response(201, json={"path": rel, "size": 0})
         return httpx.Response(404, json={"error": "not_found"})
 
     def _exec(self, body: dict) -> httpx.Response:
@@ -76,6 +89,17 @@ class Recorder:
         # argv 形式的内层命令 = 最后一项（`["bash","-c",command]`）。
         command = body.get("command") or (argv[-1] if argv else "")
         self.commands.append(command)
+        # 命令是一条 `&&` 链：`mkdir -p` 可能出现在中间（旧的 `_stage_out` 是
+        # `rm -rf … && mkdir -p …`），所以逐段找。参数里带中转目录的才是「
+        # guest 里已存在的目录」—— `_stage_out` 给绝对路径（带 root 前缀）、
+        # `_mkdirs` 给 workdir 相对路径，统一截到中转目录起点才能和文件 API 对上。
+        for segment in command.split("&&"):
+            segment = segment.strip()
+            if not segment.startswith("mkdir -p "):
+                continue
+            for token in segment[len("mkdir -p "):].split():
+                if STAGING_DIR in token:
+                    self.dirs.add(token[token.index(STAGING_DIR):])
         if "pwd" in command and self.root_error is not None:
             return httpx.Response(200, json={
                 "exec_id": "e", "exit_code": 1, "stdout": "", "stderr": self.root_error,
@@ -336,13 +360,14 @@ async def test_upload_dir_mkdirs_first_then_uploads(tmp_path, monkeypatch):
 
     await env.upload_dir(src, "/tests")
 
-    mkdir_cmd = next(c for c in rec.commands if c.startswith("mkdir -p") and "rayrun-harbor-xfer" in c)
+    # `_stage_out` 建的是中转**根**目录（绝对路径），`_mkdirs` 建的是这批文件
+    # 需要的子目录（workdir 相对）—— 按前缀把两条分开取。
+    mkdir_cmd = next(c for c in rec.commands if c.startswith(f"mkdir -p {STAGING_DIR}/"))
     # 中转根目录下一个扁平子目录，含 tests/ 一层（父目录必须先建出来）
-    assert mkdir_cmd.startswith("mkdir -p .rayrun-harbor-xfer/")
     assert mkdir_cmd.endswith("/tests")
+    staging_rel = mkdir_cmd[len("mkdir -p "):].split()[0]
     puts = rec.file_puts()
-    assert puts[0].endswith("/files/.rayrun-harbor-xfer/" + mkdir_cmd.split("/")[1] + "/Dockerfile") or \
-        ".rayrun-harbor-xfer/" in puts[0]
+    assert puts[0].endswith(f"/files/{staging_rel}/Dockerfile")
     assert puts[1].endswith("/tests/run.sh")
     # 内容并进 /tests（`/.` 而不是把中转目录本身搬过去）
     assert any(c.startswith("mkdir -p /tests && cp -a /app/.rayrun-harbor-xfer/") for c in rec.cp_commands())
@@ -369,6 +394,33 @@ async def test_upload_file_stages_then_moves(tmp_path, monkeypatch):
         c.startswith("mkdir -p /tests && cp -a /app/.rayrun-harbor-xfer/") and c.endswith(" /tests/test.sh")
         for c in rec.cp_commands()
     ), rec.commands
+
+
+@pytest.mark.asyncio
+async def test_upload_file_writes_to_a_path_that_is_not_a_directory(tmp_path, monkeypatch):
+    """中转路径**不能**被预建成目录 —— 那会让 upload_file 整个 500。
+
+    guestd 的写文件是 `O_CREATE|O_TRUNC|O_WRONLY`
+    （`guestd/internal/guest/file_ops.go:43`），往一个已存在的**目录**上写会
+    `EISDIR` ⇒ `500 file op io_error`。而 `_stage_out` 返回的路径恰恰就是
+    upload_file 落文件的地方 —— 它一旦 `mkdir -p` 过，整条通路就废了。
+
+    Recorder 建模了这条约束（PUT 撞上已知目录就返 500），所以这条用例在旧的
+    `_stage_out` 下是**真的会红**的。真机证据：`docs/plans/harbor-integration.md`
+    §13.13。
+    """
+    rec = Recorder()  # 不给 PUT 显式路由：让 Recorder 的 EISDIR 约束生效
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    local = tmp_path / "test.sh"
+    local.write_text("echo hi\n")
+    await env.upload_file(local, "/tests/test.sh")
+
+    staged = rec.file_puts()[0].split("/files/", 1)[1]
+    assert staged not in rec.dirs, f"中转路径被建成了目录：{staged}"
+    # 只建中转**根**目录，`mkdir -p` 的参数里不该出现这个 uuid 子目录
+    assert f"mkdir -p /app/{STAGING_DIR}" in rec.commands
 
 
 @pytest.mark.asyncio
