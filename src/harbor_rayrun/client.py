@@ -207,15 +207,23 @@ class RayrunClient:
     async def exec(
         self,
         sandbox_id: str,
-        command: str,
+        command: str | None = None,
         *,
+        argv: list[str] | None = None,
         cwd: str | None = None,
         env: dict[str, str] | None = None,
         timeout_seconds: int | None = None,
         user: str | None = None,
     ) -> CommandResult:
-        """`POST /v1/sandboxes/{id}/exec` —— **同步**：响应即命令结束（`06` §4.4.1）。"""
-        body: dict = {"command": command}
+        """`POST /v1/sandboxes/{id}/exec` —— **同步**：响应即命令结束（`06` §4.4.1）。
+
+        `command` 与 `argv` **恰好二选一**（`06` §4.4.1）：给 `command` 由服务端
+        归一为 `["/bin/sh","-c",command]`，给 `argv` 则原样 exec、不经 shell。
+        provider 走后者 —— 理由见 `environment.exec`。
+        """
+        if (command is None) == (argv is None):
+            raise ValueError("exec 需要 command 与 argv 恰好其一")
+        body: dict = {"argv": argv} if argv is not None else {"command": command}
         if cwd:
             body["cwd"] = cwd
         if env:

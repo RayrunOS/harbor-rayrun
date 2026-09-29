@@ -45,6 +45,9 @@ class Recorder:
         self.requests: list[httpx.Request] = []
         self.bodies: list[dict] = []
         self.commands: list[str] = []
+        # provider 用 argv 形式发 exec（`["bash","-c",command]`）：`commands` 记
+        # **内层命令文本**，好让断言停在「命令内容」这一层；包壳形状记在这里。
+        self.argv_bodies: list[list[str] | None] = []
         self.root = root
         # 非 None 时 pwd 探测失败（模拟 workdir 只读/不存在）。
         self.root_error = root_error
@@ -64,10 +67,14 @@ class Recorder:
             if request.method == method and request.url.path.startswith(prefix):
                 return response
         if request.method == "POST" and request.url.path.endswith("/exec"):
-            return self._exec(body.get("command", ""))
+            return self._exec(body)
         return httpx.Response(404, json={"error": "not_found"})
 
-    def _exec(self, command: str) -> httpx.Response:
+    def _exec(self, body: dict) -> httpx.Response:
+        argv = body.get("argv")
+        self.argv_bodies.append(argv)
+        # argv 形式的内层命令 = 最后一项（`["bash","-c",command]`）。
+        command = body.get("command") or (argv[-1] if argv else "")
         self.commands.append(command)
         if "pwd" in command and self.root_error is not None:
             return httpx.Response(200, json={
@@ -280,6 +287,25 @@ async def test_exec_passes_resolved_cwd_and_env(tmp_path, monkeypatch):
     assert body["user"] == "root"
 
 
+@pytest.mark.asyncio
+async def test_exec_wraps_command_in_bash_like_docker_provider(tmp_path, monkeypatch):
+    """shell 语义对齐 docker provider（`["bash","-c",command]`）。
+
+    Rayrun exec 的 `command` 形式经 `/bin/sh`，而 Debian/Ubuntu 的 `/bin/sh` 是
+    **dash** —— installed agent 的 `set -euo pipefail` 会在 dash 上直接语法级失败，
+    agent 连安装都过不去。这条把「走 argv + bash 包壳」钉住。
+    """
+    rec = Recorder()
+    env = make_env(tmp_path, monkeypatch, rec)
+    env._sandbox_id = "sb-1"
+
+    await env.exec("set -euo pipefail; echo hi")
+
+    assert rec.argv_bodies[-1] == ["bash", "-c", "set -euo pipefail; echo hi"]
+    # 不能退化成 `command` 形式：那正是被 dash 拒掉的那条路。
+    assert "command" not in rec.bodies[-1]
+
+
 # ---------------------------------------------------------------- 命名与文件
 def test_sandbox_name_sanitized_and_bounded(tmp_path, monkeypatch):
     """Rayrun 要求活跃沙箱名唯一且 ≤64 字符。"""
@@ -467,7 +493,8 @@ async def test_failed_download_cleans_staging(tmp_path, monkeypatch):
 
     def failing_exec(request: httpx.Request) -> httpx.Response:
         body = json.loads(request.content) if request.content else {}
-        cmd = body.get("command", "")
+        argv = body.get("argv")
+        cmd = body.get("command") or (argv[-1] if argv else "")
         if "cp -a" in cmd:
             rec.commands.append(cmd)
             return httpx.Response(200, json={
@@ -475,7 +502,7 @@ async def test_failed_download_cleans_staging(tmp_path, monkeypatch):
                 "stderr": "cp: cannot stat '/logs/agent': No such file or directory",
                 "duration_ms": 1, "timed_out": False, "truncated": False,
             })
-        return rec._exec(cmd)
+        return rec._exec(body)
 
     # 构造之后再换 client：make_env 自己会 monkeypatch RayrunClient（覆盖上面那条）。
     env = make_env(tmp_path, monkeypatch, Recorder())

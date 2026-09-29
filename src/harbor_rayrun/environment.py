@@ -276,9 +276,16 @@ class RayrunEnvironment(BaseEnvironment):
         if resolved_user not in (None, "root", 0, "0"):
             raise ValueError(f"Rayrun 只支持以 root 执行命令（收到 user={resolved_user!r}）")
 
+        # **shell 语义必须对齐 docker provider**（`["bash","-c",command]`，
+        # `environments/docker/docker_unix.py:281`）：installed agent 全都写
+        # `set -euo pipefail` 之类的 bash 特性，而 Rayrun exec 的 `command` 形式
+        # 归一为 `["/bin/sh","-c",…]`（`daemon/internal/app/exec.go:193`）——
+        # Debian/Ubuntu 的 `/bin/sh` 是 **dash**，当场 `set: Illegal option -o
+        # pipefail`，agent 连装都装不上。走 `argv` 而不是 `command` 是为了少一层
+        # `/bin/sh -c` 与随之而来的引号转义（exec 端点原生支持 argv，`06` §4.4.1）。
         result = await self._client.exec(
             sandbox_id,
-            command,
+            argv=["bash", "-c", command],
             cwd=cwd,
             env=self._merge_env(env),
             timeout_seconds=timeout_sec or DEFAULT_EXEC_TIMEOUT_SEC,
