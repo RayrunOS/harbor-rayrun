@@ -28,7 +28,7 @@ uv pip install ./integrations/harbor-rayrun
 # 2. 凭证（沿用 CLI 的 env 名，docs/07 §2.5）
 # 托管环境（2026-10-28 起）：https://api.rayrunos.com/v1
 # 自托管 / dev：           http://<daemon 主机>:8080/v1
-# ⚠️ dashboard.rayrunos.com/v1 已硬性 410，不是 API 入口
+# ⚠️ dashboard.rayrunos.com/v1 最终态 410，不是 API 入口
 export RAYRUN_API_URL=https://api.rayrunos.com/v1
 export RAYRUN_TOKEN=rayrun_<token_id>_<secret>
 
