@@ -26,7 +26,10 @@ trial 的隔离环境由 provider 实现，本包把它落到 Rayrun 的 HTTP AP
 uv pip install ./integrations/harbor-rayrun
 
 # 2. 凭证（沿用 CLI 的 env 名，docs/07 §2.5）
-export RAYRUN_API_URL=http://<daemon 主机>:8080/v1
+# 托管环境（2026-10-28 起）：https://api.rayrunos.com/v1
+# 自托管 / dev：           http://<daemon 主机>:8080/v1
+# ⚠️ dashboard.rayrunos.com/v1 已硬性 410，不是 API 入口
+export RAYRUN_API_URL=https://api.rayrunos.com/v1
 export RAYRUN_TOKEN=rayrun_<token_id>_<secret>
 
 # 3. 跑（provider 用 --env 的 module:Class 入口，不需要改 Harbor 上游）

@@ -114,7 +114,8 @@ class RayrunEnvironment(BaseEnvironment):
         if missing:
             raise SystemExit(
                 f"Rayrun provider 需要 {' 与 '.join(missing)}。\n"
-                "  export RAYRUN_API_URL=http://<daemon 主机>:8080/v1\n"
+                "  托管：export RAYRUN_API_URL=https://api.rayrunos.com/v1\n"
+                "  自托管：export RAYRUN_API_URL=http://<daemon 主机>:8080/v1\n"
                 "  export RAYRUN_TOKEN=rayrun_<token_id>_<secret>\n"
                 "（与 CLI 同名，见 docs/07 §2.5）"
             )

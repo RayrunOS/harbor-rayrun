@@ -5,7 +5,7 @@ Harbor 的 `BaseEnvironment.type()` 显式允许返回任意字符串（它的�
 Harbor 上游改动即可用 `--env` 入口加载：
 
     uv pip install ./integrations/harbor-rayrun
-    export RAYRUN_API_URL=http://<daemon>:8080/v1
+    export RAYRUN_API_URL=https://api.rayrunos.com/v1   # 自托管：http://<daemon>:8080/v1
     export RAYRUN_TOKEN=rayrun_<token_id>_<secret>
     harbor run -t <task> -a oracle -e harbor_rayrun:RayrunEnvironment
 
