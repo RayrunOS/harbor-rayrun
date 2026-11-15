@@ -1,39 +1,38 @@
-"""Rayrun 沙箱云的 Harbor provider（`docs/plans/harbor-integration.md` M3）。
+"""Rayrun 沙箱云的 Harbor provider。
 
 Harbor 把每个 trial 跑在一个隔离环境里，环境由 provider 实现。本文件把那个环境
-接到 **Rayrun 的 HTTP API**（控制面）—— 与 E2B/Daytona 那类 provider 不同，这里
-**不走沙箱的入向**（不拨端口、不需要公网域名），所以不依赖 `docs/13` 的服务发布。
+接到 Rayrun 的 HTTP API（控制面），不拨沙箱入向端口。
 
-契约面（`15` §2.1）与 Rayrun 端点（`06` §4）的映射：
+契约映射：
 
     start(force_build)           → 校验镜像存在 + POST /sandboxes（201 即 Running）
     stop(delete=True)            → DELETE /sandboxes/{id}
-    stop(delete=False)           → POST /sandboxes/{id}/stop  ← ADR-005 冷停：留盘停表
-    exec(...)                    → POST /sandboxes/{id}/exec  ← M1 新落的原语（ADR-007）
+    stop(delete=False)           → POST /sandboxes/{id}/stop（冷停：留盘、停表、IP 不变）
+    exec(...)                    → POST /sandboxes/{id}/exec（同步）
     upload_file / upload_dir     → PUT  /sandboxes/{id}/files/{path}
     download_file / download_dir → GET …/files/{path} + GET …/files（单层列目录）
     is_dir / is_file             → 基类默认实现（走 exec 的 test -d/-f），不覆写
 
-**已知边界（诚实声明，不是缺陷；`15` §6.3「声明即契约」）**：
+已知边界（声明即契约，不虚报）：
 
-1. **不支持 PUBLIC 出网**：Rayrun 的 egress 是「精确白名单」模型，**没有「允许全部」
-   档位**（`06` §4.3）。Harbor 的 `NetworkPolicy` 默认是 `PUBLIC`，这类任务会在建沙箱
-   之前**明确报错** —— 绝不静默降级成断网（那会让任务以为能联网却莫名失败），也绝不
-   假装白名单能覆盖「全部」。要跑这类任务：任务声明 `network_mode = "allowlist"`
-   （列出所需域名）或 `"no-network"`。⚠️ Harbor 对 `PUBLIC` 没有能力位可拦，
-   所以这道闸必须在本 provider 里。
+1. **网络策略精确映射**。`no-network` → `egress.allow=[]`；`allowlist` →
+   `egress.allow=[...]`；Harbor 默认的 `public` → `egress.allow_all=true`
+   （显式档位，会进审计）。三种都不做静默近似。
 2. **不支持 docker-compose 任务**（`capabilities.docker_compose=False`，Harbor 会在
    开跑前按声明裁剪任务）。
-3. **无 GPU / TPU / Windows**；**不支持运行期改网络策略**（`dynamic_network_policy=False`）。
-4. **镜像不由 Harbor 构建**（也刻意不给 provider 加构建能力：那等于把「构建任意
-   Dockerfile」的 RCE 面开在产品面上，`15` §5.1 方案 A 已否决）。镜像来自离线 builder
-   （`images/build-task-image.sh`）；缺失时 `start()` 报错并附一条可直接复制的构建命令。
+3. **无 GPU / TPU / Windows**；**不支持运行期改网络策略**
+   （`dynamic_network_policy=False`）；**不支持流式**（Harbor 0.26 的
+   `capabilities.stream=False`：没有 SSH 执行和 TCP 转发）。
+4. **镜像不由本 provider 构建**。托管环境用平台 builder `POST /v1/builds`
+   （默认整根可写，不要上传本地 rootfs）；自托管用平台树里的
+   `images/build-task-image.sh --root-writable`。缺失时 `start()` 报错并给出这两条路。
 5. 单次 exec 的输出上限 4 MiB（超出置 `truncated`，会打 warn）；命令超时按
    `timeout(1)` 惯例给 Harbor 返回 124（Rayrun 契约里超时的 `exit_code` 是 null）。
 """
 
 from __future__ import annotations
 
+import json
 import os
 import shlex
 import uuid
@@ -98,8 +97,9 @@ HONORED_WRITABLE_DIRS: tuple[str, ...] = (
     str(_HARBOR_PATHS.solution_dir),
 )
 WRITABLE_HINT = (
-    "  ⚠ --writable-dir 是**必需**的（不是可选优化）：这几个目录在沙箱里默认只读，"
-    "详见 docs/plans/harbor-integration.md §13.3"
+    "⚠ --root-writable 是必需的（不是可选优化）："
+    + "、".join(HONORED_WRITABLE_DIRS)
+    + " 在沙箱里默认只读。托管环境用 POST /v1/builds（默认整根可写），不要上传本地 rootfs。"
 )
 
 
@@ -108,8 +108,13 @@ class RayrunEnvironment(BaseEnvironment):
 
     @classmethod
     @override
-    def preflight(cls) -> None:
-        """开跑前校验凭证（Harbor 在 job 启动时调用；失败即 SystemExit）。"""
+    def preflight(cls, kwargs: dict | None = None) -> None:
+        """开跑前校验凭证（Harbor 在 job 启动时调用；失败即 SystemExit）。
+
+        Harbor 0.26：覆写必须接受 ``kwargs=None`` 并先调用
+        ``super().preflight(kwargs)``，让基类完成 options 校验。
+        """
+        super().preflight(kwargs)
         missing = [k for k in (ENV_API_URL, ENV_TOKEN) if not os.environ.get(k)]
         if missing:
             raise SystemExit(
@@ -117,7 +122,7 @@ class RayrunEnvironment(BaseEnvironment):
                 "  托管：export RAYRUN_API_URL=https://api.rayrunos.com/v1\n"
                 "  自托管：export RAYRUN_API_URL=http://<daemon 主机>:8080/v1\n"
                 "  export RAYRUN_TOKEN=rayrun_<token_id>_<secret>\n"
-                "（与 CLI 同名，见 docs/07 §2.5）"
+                "  dashboard.rayrunos.com/v1 已返回 410，不是 API 入口。"
             )
 
     def __init__(
@@ -159,19 +164,23 @@ class RayrunEnvironment(BaseEnvironment):
     @override
     def resource_capabilities(cls) -> EnvironmentResourceCapabilities:
         # 创建期硬分配（`06` §4.3 的 cpu_cores / memory_mb 即上限），不做 request 档。
+        # fractional_cpus 是 Harbor 0.26 的字段。Rayrun 的 cpu_cores 是整数。
         return EnvironmentResourceCapabilities(
             cpu_limit=True,
             memory_limit=True,
             cpu_request=False,
             memory_request=False,
+            fractional_cpus=False,
         )
 
     @property
     @override
     def capabilities(self) -> EnvironmentCapabilities:
-        # 字段名**逐条对着装好的 harbor 版本核过**（0.23.0 里没有 `stream` —— 那
-        # 是 main 分支新加的；pydantic 会静默忽略未知字段，写错了不会报错）。
+        # 字段名对着 Harbor 0.26.0 的 EnvironmentCapabilities 核过。
+        # `stream` 在 0.26 里存在：本 provider 没有 SSH / TCP 转发，必须显式 False
+        # （pydantic 会忽略未知字段，漏写不会报错，默认值恰好也是 False）。
         return EnvironmentCapabilities(
+            stream=False,
             gpus=False,
             tpus=False,
             windows=False,
@@ -194,7 +203,8 @@ class RayrunEnvironment(BaseEnvironment):
         if (self.environment_dir / COMPOSE_FILE_NAME).exists():
             raise ValueError(
                 f"Rayrun 不支持 docker-compose 任务（{self.environment_dir}/{COMPOSE_FILE_NAME}）。\n"
-                "  可行路径：把该任务的环境改写成单个 Dockerfile，再用离线 builder 产成 Rayrun 镜像。"
+                "  可行路径：把该任务的环境改写成单个 Dockerfile，再用平台 builder"
+                "（POST /v1/builds）或自托管离线 builder（--root-writable）产成 Rayrun 镜像。"
             )
         require_agent_environment_definition(
             self.environment_dir,
@@ -207,10 +217,9 @@ class RayrunEnvironment(BaseEnvironment):
         """建沙箱。
 
         `force_build` 对 Rayrun 无意义（镜像不由 provider 构建，见类文档第 4 条）——
-        刻意不静默忽略它：镜像不存在时直接报错并给出构建命令。
+        镜像不存在时直接报错并给出构建途径，不在 provider 里现场构建。
 
-        顺序有讲究：**先算 egress（PUBLIC 会在这里抛错）→ 再校验镜像 → 最后建沙箱**，
-        免得为一个注定要拒绝的任务白建一台 VM。
+        顺序：**先算 egress（`public` 映射为 allow_all）→ 再校验镜像 → 最后建沙箱**。
         """
         if self._sandbox_id is not None:
             raise RuntimeError(f"环境已启动（sandbox={self._sandbox_id}），不要重复 start")
@@ -396,8 +405,8 @@ class RayrunEnvironment(BaseEnvironment):
         用 `pwd` 问 guest 而不是读 manifest：manifest 不过 HTTP，provider 侧拿
         不到；而 exec 的缺省 cwd 恰好就是 workdir（`10` §3.9），问一次即可，
         不需要为 provider 新增接口。顺带在同一趟里验证**它可写** —— 写不了的话
-        每次传输都会以 `io_error` 失败，而那个报错完全指不出「镜像的 workdir
-        只读，要用 --writable-dir 重建」（`docs/plans/harbor-integration.md` §13.3）。
+        每次传输都会以 `io_error` 失败，而那个报错指不出「镜像的 workdir 只读，
+        要用 --root-writable 或平台 builder 重建」。
         """
         if self._root is None:
             # 刻意不经 _run：它的通用报错指不出这里该给的那条修法。
@@ -411,10 +420,12 @@ class RayrunEnvironment(BaseEnvironment):
             if result.exit_code != 0 or not root.startswith("/"):
                 raise RuntimeError(
                     f"沙箱 workdir 不可写或不可用（exit={result.exit_code}）：{result.stderr.strip()[:200]}\n"
-                    "  任务镜像的 workdir 若不在默认可写的子树里（/usr /etc /var /opt /root /home /srv），"
-                    "重建镜像时要声明：\n"
-                    "    images/build-task-image.sh … --writable-dir <workdir>\n"
-                    "  见 docs/plans/harbor-integration.md §13.3 与 ADR-006 修订。"
+                    "  任务镜像的 workdir 若不在默认可写子树里（/usr /etc /var /opt /root /home /srv），"
+                    "需要整根可写。\n"
+                    "  托管：用平台 builder 重建（POST /v1/builds，默认整根可写），不要上传本地 rootfs。\n"
+                    "  自托管：在 Rayrun 平台树里重建，必须带 --root-writable：\n"
+                    "    images/build-task-image.sh --dockerfile <Dockerfile> \\\n"
+                    "        --name <name> --version 1 --out /tmp/task-images --root-writable"
                 )
             self._root = root
         return self._root
@@ -522,29 +533,36 @@ class RayrunEnvironment(BaseEnvironment):
         return sorted(set(policy.allowed_hosts)), False
 
     async def _require_image(self, image_ref: str) -> None:
-        """镜像必须已在 Rayrun 宿主机上（Rayrun 不做镜像构建，见类文档第 4 条）。"""
+        """镜像必须已在目标 Rayrun 环境里（GET /v1/agents；见类文档第 4 条）。"""
         agents = await self._client.agents()
         existing = {f"{a.get('name')}@{a.get('version')}" for a in agents}
         if image_ref in existing:
             return
         name, _, version = image_ref.partition("@")
-        available = "、".join(sorted(existing)) or "（宿主机镜像目录为空）"
-        # 镜像里的 source 两种形态都要能照做：Dockerfile（本地可构建）与
-        # docker_image（预构建，任务只给了引用）。
+        available = "、".join(sorted(existing)) or "（当前环境没有镜像）"
+        # 自托管离线 builder 的源：Dockerfile（本地可构建）或 docker_image（预构建引用）。
         source = (
             f"--image {shlex.quote(self.task_env_config.docker_image)}"
             if self.task_env_config.docker_image
             else f"--dockerfile {self.environment_dir}/Dockerfile"
         )
         raise ValueError(
-            f"Rayrun 宿主机上没有镜像 {image_ref}。\n"
-            "  在**有 docker 的构建机**上产一张（离线 builder，见 docs/plans/harbor-integration.md §10）：\n"
+            f"Rayrun 上没有镜像 {image_ref}。\n"
+            "  托管：用平台 builder 现场构建（POST /v1/builds），不要把本地 rootfs.ext4"
+            " 或镜像目录传到线上。\n"
+            "    curl -sS -X POST -H \"Authorization: Bearer $RAYRUN_TOKEN\" \\\n"
+            "      -H 'Content-Type: application/json' \\\n"
+            f"      -d '{json.dumps({'name': name, 'dockerfile': '<Dockerfile 原文>'}, ensure_ascii=False)}' \\\n"
+            "      \"$RAYRUN_API_URL/builds\"\n"
+            "    202 后轮询 GET /v1/builds/{id}，用 succeeded 的 image_ref"
+            " 对齐 RAYRUN_IMAGE_PREFIX / RAYRUN_IMAGE_VERSION。平台 builder 默认整根可写。\n"
+            "  自托管：脚本在 Rayrun 平台树 images/build-task-image.sh（需要本机 docker）。"
+            " --root-writable 必需：\n"
             f"    images/build-task-image.sh {source} \\\n"
-            f"        --name {name} --version {version or '1'} --out /tmp/task-images \\\n"
-            f"        {' '.join(f'--writable-dir {d}' for d in HONORED_WRITABLE_DIRS)}\n"
-            f"    rsync -a --sparse /tmp/task-images/{image_ref}/ <宿主机>:$RAYRUN_IMAGES_DIR/\n"
+            f"        --name {name} --version {version or '1'} --out /tmp/task-images --root-writable\n"
+            "    把产出目录放到本机 RAYRUN_IMAGES_DIR（只用于自托管）。\n"
             f"  {WRITABLE_HINT}\n"
-            f"  宿主机现有镜像：{available}"
+            f"  现有镜像：{available}"
         )
 
     async def _mkdirs(self, sandbox_id: str, dirs: list[str]) -> None:
