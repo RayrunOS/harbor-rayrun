@@ -4,7 +4,7 @@
 
 ## What Rayrun is
 
-[Rayrun](https://rayrunos.com/docs/) is a sandbox cloud for agent workloads. Each sandbox is its own lightweight virtual machine (the docs describe it as a Firecracker microVM). It is not a shared machine that stays up between runs.
+[Rayrun](https://rayrunos.com/docs/) is a sandbox cloud for agent workloads. Each sandbox is its own lightweight virtual machine. It is not a shared machine that stays up between runs.
 
 This repository is `harbor-rayrun`. It lets [Harbor](https://docs.harborframework.com) use those sandboxes. A Harbor trial is one run of one task. This provider talks to Rayrun over HTTP and starts a new sandbox for that trial.
 
@@ -68,7 +68,7 @@ If either variable is missing, preflight exits before Harbor queues the trial.
 
 Hosted Rayrun: build with `POST /v1/builds`. The call returns **202**. Poll `GET /v1/builds/{id}` and read `image_ref`. Do not upload a local `rootfs.ext4` or an image directory. The public API has no upload for that file. The request is in [Build an image on hosted Rayrun](#build-an-image-on-hosted-rayrun), and the field list is on [镜像与构建](https://rayrunos.com/docs/api/images/).
 
-Self-hosted Rayrun: the [Harbor guide](https://rayrunos.com/docs/integrations/harbor/) says to use `images/build-task-image.sh` from the Rayrun platform tree (the private RayrunOS/RayrunOS repository), on a machine that has Docker. That page does not list the script's flags. If the image is missing, this provider prints a command. Copy that command. It passes `--root-writable`. Do not add the older `--writable-dir /logs`, `--writable-dir /tests`, and `--writable-dir /solution`.
+Self-hosted Rayrun: the image still has to exist in that instance before `harbor run`. This package does not include an image builder. Self-hosted image preparation is on the public [Harbor guide](https://rayrunos.com/docs/integrations/harbor/). Do not upload a local `rootfs.ext4` or an image directory to hosted Rayrun.
 
 The Harbor guide still says Rayrun does not build images, and that hosted users should mail [support@rayrunos.com](mailto:support@rayrunos.com) to have an image prepared. The API reference documents building a Dockerfile yourself with `POST /v1/builds`. Follow the API reference for the request.
 
@@ -144,29 +144,15 @@ To delete an image you built: `DELETE /v1/images/{ref}`. Take `ref` from `GET /v
 
 ### Build an image for a self-hosted Rayrun
 
-The [Harbor guide](https://rayrunos.com/docs/integrations/harbor/) names `images/build-task-image.sh` in the Rayrun platform tree and does not list its flags. The tree is the private RayrunOS/RayrunOS repository. Run the script on a machine with Docker.
+This package does not include an image builder. Self-hosted image preparation is on the public [Harbor guide](https://rayrunos.com/docs/integrations/harbor/). Follow that page.
 
-When the image is missing, this provider prints a command like the one below. `--root-writable` is there because Harbor has to write `/logs`, `/tests`, and `/solution`:
-
-```bash
-# task ships environment/Dockerfile
-images/build-task-image.sh --dockerfile <task>/environment/Dockerfile \
-    --name <task-dir> --version 1 --out /tmp/task-images --root-writable
-
-# task.toml names a prebuilt image (docker_image)
-images/build-task-image.sh --image <docker_image from task.toml> \
-    --name <task-dir> --version 1 --out /tmp/task-images --root-writable
-```
-
-Put the output where that self-hosted daemon reads images. The error text calls that directory `RAYRUN_IMAGES_DIR`. This path is only for a self-hosted daemon. Do not upload it to hosted Rayrun.
-
-Do not pass `--writable-dir /logs`, `--writable-dir /tests`, or `--writable-dir /solution`. Those three flags are obsolete. This package does not print them.
+Do not upload a local `rootfs.ext4` or an image directory to hosted Rayrun. The public API has no upload for that file. A hosted image is built with `POST /v1/builds`, in the previous section.
 
 ### Why `/logs`, `/tests`, and `/solution` must be writable
 
 Harbor writes the reward to `/logs/verifier/reward.txt`. It uploads tests to `/tests` and the reference solution to `/solution`. If those paths are not writable, the verifier cannot write the reward file. Harbor then only reports that the file is missing.
 
-The public builds page does not document a writable-root switch on `POST /v1/builds`. This package's errors, when the image is missing or the sandbox workdir is read-only, tell you to rebuild with a writable root: hosted, with `POST /v1/builds`; self-hosted, with `images/build-task-image.sh --root-writable`.
+The public builds page does not document a writable-root switch on `POST /v1/builds`. When the image is missing, or the sandbox workdir is read-only, this package's error tells you to rebuild so `/logs`, `/tests`, and `/solution` can be written. On hosted Rayrun that rebuild is `POST /v1/builds`. Do not upload a local `rootfs.ext4`. Self-hosted image preparation stays on the public [Harbor guide](https://rayrunos.com/docs/integrations/harbor/).
 
 ### Network policy
 

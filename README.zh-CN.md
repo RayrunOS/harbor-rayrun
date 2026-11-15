@@ -4,7 +4,7 @@
 
 ## Rayrun 是什么
 
-[Rayrun](https://rayrunos.com/docs/) 是面向 Agent 的沙箱云。每个沙箱是一台单独的轻量虚拟机（文档里的说法是 Firecracker microVM）。它不是一台大家共用、一直开着的机器。
+[Rayrun](https://rayrunos.com/docs/) 是面向 Agent 的沙箱云。每个沙箱是一台单独的轻量虚拟机。它不是一台大家共用、一直开着的机器。
 
 这个仓库是 `harbor-rayrun`。它让 [Harbor](https://docs.harborframework.com) 能用这些沙箱。Harbor 里的一次 trial，就是一个任务跑一遍。本 provider 通过 HTTP 调用 Rayrun，为这一次 trial 单独开一台沙箱。
 
@@ -68,7 +68,7 @@ export RAYRUN_TOKEN=rayrun_<token_id>_<secret>
 
 托管环境：用 `POST /v1/builds` 构建。调用返回 **202**。再轮询 `GET /v1/builds/{id}`，读返回里的 `image_ref`。不要上传本地的 `rootfs.ext4`，也不要上传镜像目录。公开 API 没有这个上传入口。请求示例在 [在托管环境上构建镜像](#在托管环境上构建镜像)，字段表在 [镜像与构建](https://rayrunos.com/docs/api/images/)。
 
-自托管： [Harbor 指南](https://rayrunos.com/docs/integrations/harbor/) 写的是用平台树里的 `images/build-task-image.sh`（私有仓库 RayrunOS/RayrunOS），在有 Docker 的机器上执行。那一页没有列出脚本参数。镜像不存在时，本 provider 会打印一条命令，照着抄即可。那条命令带 `--root-writable`。不要再加已经废弃的 `--writable-dir /logs`、`--writable-dir /tests`、`--writable-dir /solution`。
+自托管：镜像仍须事先就在那套实例里，`harbor run` 不会构建它。本包不带镜像构建器。自托管的镜像准备以公开的 [Harbor 指南](https://rayrunos.com/docs/integrations/harbor/) 为准。不要把本地 `rootfs.ext4` 或镜像目录传到托管环境。
 
 Harbor 指南仍写着 Rayrun 不做镜像构建，托管用户要发邮件到 [support@rayrunos.com](mailto:support@rayrunos.com) 请对方备好镜像。API 参考已经写了用 `POST /v1/builds` 自己提交 Dockerfile。请求以 API 参考为准。
 
@@ -144,29 +144,15 @@ curl -sS -X POST \
 
 ### 在自托管环境上构建镜像
 
-[Harbor 指南](https://rayrunos.com/docs/integrations/harbor/) 点名了平台树里的 `images/build-task-image.sh`，但没有写参数。这棵树是私有仓库 RayrunOS/RayrunOS。在有 Docker 的机器上执行。
+本包不带镜像构建器。自托管的镜像准备以公开的 [Harbor 指南](https://rayrunos.com/docs/integrations/harbor/) 为准。
 
-镜像缺失时，本 provider 打印的命令如下。带 `--root-writable`，是因为 Harbor 要写 `/logs`、`/tests` 和 `/solution`：
-
-```bash
-# 任务自带 environment/Dockerfile
-images/build-task-image.sh --dockerfile <任务>/environment/Dockerfile \
-    --name <任务目录名> --version 1 --out /tmp/task-images --root-writable
-
-# task.toml 里写了现成镜像（docker_image）
-images/build-task-image.sh --image <task.toml 里的 docker_image> \
-    --name <任务目录名> --version 1 --out /tmp/task-images --root-writable
-```
-
-产物放到这套自托管 daemon 读镜像的目录。报错文本里这个目录叫 `RAYRUN_IMAGES_DIR`。这条路只用于自托管，不要把这个目录传到托管环境。
-
-不要再传 `--writable-dir /logs`、`--writable-dir /tests`、`--writable-dir /solution`。这三个参数已经废弃，本包的报错里也不会打印它们。
+不要把本地 `rootfs.ext4` 或镜像目录传到托管环境。公开 API 没有这个上传入口。托管环境上的镜像用上一节的 `POST /v1/builds` 构建。
 
 ### 为什么 `/logs`、`/tests`、`/solution` 必须可写
 
 Harbor 把得分写在 `/logs/verifier/reward.txt`。测试在 `/tests`，参考解上传到 `/solution`。这几个路径不能写时，校验写不出得分文件，Harbor 只会报这个文件不存在。
 
-公开的构建文档没有在 `POST /v1/builds` 上写一个「整根可写」开关。镜像缺失，或沙箱工作目录只读时，本包的报错会让你换成可写的根再构建：托管走 `POST /v1/builds`，自托管走 `images/build-task-image.sh --root-writable`。
+公开的构建文档没有在 `POST /v1/builds` 上写一个「整根可写」开关。镜像缺失，或沙箱工作目录只读时，本包的报错会让你重新构建，使 `/logs`、`/tests`、`/solution` 可以写入。托管环境的这次重建走 `POST /v1/builds`。不要上传本地 `rootfs.ext4`。自托管的镜像准备以公开的 [Harbor 指南](https://rayrunos.com/docs/integrations/harbor/) 为准。
 
 ### 网络策略
 
