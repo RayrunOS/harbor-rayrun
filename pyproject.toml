@@ -1,7 +1,7 @@
 [project]
 name = "harbor-rayrun"
 version = "0.1.0"
-description = "Harbor provider：把 Rayrun 沙箱云接成 Harbor 的评测环境（docs/plans/harbor-integration.md M3）"
+description = "Harbor provider：把 Rayrun 沙箱云接成 Harbor 的评测环境"
 readme = "README.md"
 requires-python = ">=3.12"
 # 依赖只有两个：Harbor 本体（提供 BaseEnvironment 抽象面）与 httpx（打 Rayrun 的

@@ -1,4 +1,4 @@
-# Python 工程的生成物（本包是仓库里唯一的 Python 包）
+# Python 工程的生成物
 .venv/
 __pycache__/
 .pytest_cache/

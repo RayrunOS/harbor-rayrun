@@ -1,8 +1,7 @@
-# rayrun/integrations/harbor-rayrun —— 构建配方（make -C integrations/harbor-rayrun <target>）
+# harbor-rayrun —— 构建配方（仓库根：make <target>）
 #
-# 这是仓库里唯一的 Python 包（provider 侧），所以它的「构建」= 建 venv + 装依赖，
-# 「测试」= pytest。**刻意不接进顶层 `make test`**：那会让整仓测试依赖网络与 PyPI
-# 镜像（Go/web/site 都不依赖），代价大于收益。要跑就显式跑这一条。
+# 本仓库只有 provider 这一个 Python 包，所以它的「构建」= 建 venv + 装依赖，
+# 「测试」= pytest。依赖网络与 PyPI 镜像，显式跑 `make test`。
 
 VENV     ?= .venv
 PYTHON   ?= python3

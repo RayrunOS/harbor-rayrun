@@ -3,7 +3,10 @@
 把 **Rayrun 沙箱云**接成 [Harbor](https://docs.harborframework.com) 的评测环境：Harbor 每个
 trial 的隔离环境由 provider 实现，本包把它落到 Rayrun 的 HTTP API 上。
 
-设计真相源：`docs/plans/harbor-integration.md`（M3）；外部契约取证见 `docs/15` §2.1。
+本仓库是 **独立仓库**（2026-11-15 从 Rayrun 主仓库的 `integrations/harbor-rayrun/` 拆出）。
+下文出现的 `docs/...`、`images/...`、`CLAUDE.md` 都指
+[Rayrun 主仓库](https://github.com/RayrunOS/RayrunOS) 内的路径：设计真相源
+`docs/plans/harbor-integration.md`（M3），外部契约取证见 `docs/15` §2.1。
 
 ## 它负责什么
 
@@ -23,7 +26,8 @@ trial 的隔离环境由 provider 实现，本包把它落到 Rayrun 的 HTTP AP
 
 ```bash
 # 1. 装（Harbor 与 provider 在同一个 Python 环境里）
-uv pip install ./integrations/harbor-rayrun
+uv pip install git+ssh://git@github.com/RayrunOS/harbor-rayrun.git
+# 或在本仓库根目录：uv pip install .
 
 # 2. 凭证（沿用 CLI 的 env 名，docs/07 §2.5）
 # 托管环境（2026-10-28 起）：https://api.rayrunos.com/v1
