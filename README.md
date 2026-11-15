@@ -1,172 +1,195 @@
-# harbor-rayrun —— Rayrun 的 Harbor provider
+[English](README.md) | [中文](README.zh-CN.md)
 
-把 **Rayrun 沙箱云**接成 [Harbor](https://docs.harborframework.com) 的评测环境。Harbor 每个
-trial 的隔离环境由 provider 实现；本包装上 Rayrun 的 HTTP API，用
-`-e harbor_rayrun:RayrunEnvironment` 加载，不需要改 Harbor 上游。
+# harbor-rayrun
 
-平台仓库是 [RayrunOS/RayrunOS](https://github.com/RayrunOS/RayrunOS)。下面的安装、凭证、
-镜像和网络说明都写在本文里，按本文即可跑起来。
+## What Rayrun is
 
-## 它负责什么
+[Rayrun](https://rayrunos.com/docs/) is a sandbox cloud for agent workloads. Each sandbox is its own lightweight virtual machine (the docs describe it as a Firecracker microVM). It is not a shared machine that stays up between runs.
 
-| Harbor 契约 | 落到 Rayrun |
-|---|---|
-| `start(force_build)` | 校验镜像已存在 → `POST /v1/sandboxes`（201 即 Running） |
-| `stop(delete=True/False)` | `DELETE /sandboxes/{id}` / `POST …/stop`（冷停：留盘、停表、IP 不变） |
-| `exec(command, cwd, env, timeout_sec, user)` | `POST /sandboxes/{id}/exec`（同步；以 `["bash","-c",…]` 执行） |
-| `upload_file` / `upload_dir` | `PUT /sandboxes/{id}/files/{path}`（先 `mkdir -p`：写文件不建父目录） |
-| `download_file` / `download_dir` | `GET …/files/{path}`；列目录是单层的，provider 自己递归 |
-| `is_dir` / `is_file` | 用基类默认实现（走 `exec` 的 `test -d/-f`），不覆写 |
+This repository is `harbor-rayrun`. It lets [Harbor](https://docs.harborframework.com) use those sandboxes. A Harbor trial is one run of one task. This provider talks to Rayrun over HTTP and starts a new sandbox for that trial.
 
-本 provider **不**构建镜像、**不**做 SSH / 流式（`stream=False`）、**不**支持 GPU、TPU、
-Windows 或 docker-compose。
+Load it with `-e harbor_rayrun:RayrunEnvironment`.
 
-## 安装
+This is a custom Harbor sandbox, not one of the sandboxes shipped inside Harbor. It does not appear in `harbor environment list`. Harbor loads it by import path (`module:Class`), the same way it loads any other sandbox that lives outside the Harbor tree. See Harbor's [custom sandboxes](https://docs.harborframework.com/sandboxes/custom-sandboxes) and Rayrun's [Harbor guide](https://rayrunos.com/docs/integrations/harbor/).
 
-Harbor 与 provider 必须在同一个 Python 环境里。本包依赖 `harbor>=0.26,<0.27`。
+## What you can do with it
+
+For each trial, this provider can:
+
+- start a sandbox, and stop or delete it when the trial ends
+- run commands inside the sandbox
+- upload files into the sandbox and download files back out
+- apply the task's Harbor network policy: no network, an allowlist, or the public internet
+
+It does not:
+
+- build the task image inside Harbor. `--force-build` does not build a Rayrun image. The image must already exist in that Rayrun environment.
+- give Harbor SSH or TCP forwarding. Harbor calls that capability `stream`; this provider sets `stream=False`. Rayrun's own console and CLI can still open a terminal. Rayrun's SSH is shell and exec only: it does not forward ports. See [交互式终端与 SSH](https://rayrunos.com/docs/executable/terminal-ssh/).
+- support GPU, TPU, Windows, or docker-compose. A task that ships `docker-compose.yaml` (several containers in one file) is rejected.
+
+## Install
+
+Harbor and this package must be in the same Python environment. The package needs Python 3.12 or newer. It depends on `harbor>=0.26,<0.27`.
 
 ```bash
 uv pip install harbor-rayrun
-# 或从 GitHub（HTTPS）：
-uv pip install "git+https://github.com/RayrunOS/harbor-rayrun.git"
-# 或在本仓库根目录：
-uv pip install .
 ```
 
-## 凭证
-
-API 基址必须带 `/v1`。托管环境用 `https://api.rayrunos.com/v1`。
-`https://dashboard.rayrunos.com/v1` 已返回 **410**，不是 API 入口。
-
-Token 在控制台「设置 → 我的 API Token」签发，形如 `rayrun_<token_id>_<secret>`。
+From this Git repository, over HTTPS:
 
 ```bash
-# 托管
+uv pip install "git+https://github.com/RayrunOS/harbor-rayrun.git"
+```
+
+From a checkout of this repository: `uv pip install .`
+
+Rayrun's Harbor guide still lists `harbor>=0.23,<0.24`. Install the 0.26 line this package declares. An older Harbor cannot load it.
+
+## Run a first trial
+
+### Set the API address and the token
+
+```bash
 export RAYRUN_API_URL=https://api.rayrunos.com/v1
-# 自托管 / 本机 daemon
-# export RAYRUN_API_URL=http://<daemon 主机>:8080/v1
 export RAYRUN_TOKEN=rayrun_<token_id>_<secret>
 ```
 
-缺任何一个，`preflight` 会在 trial 排队前直接退出。
+The hosted API base is `https://api.rayrunos.com/v1`. The `/v1` suffix is required. Create the token in the console under **设置 → 我的 API Token** (Settings → My API token). The plaintext is shown once, and it looks like `rayrun_<token_id>_<secret>`.
 
-## 跑
+The console is [https://dashboard.rayrunos.com](https://dashboard.rayrunos.com). Do not use that host as `RAYRUN_API_URL`. `https://dashboard.rayrunos.com/v1` returns 410. It is not the API.
+
+How these two variables work is in [安装与配置](https://rayrunos.com/docs/cli/install/). For a self-hosted Rayrun, set `RAYRUN_API_URL` to that instance's `/v1` address. The same page is the reference. This package's preflight text also shows `http://<daemon host>:8080/v1` as a self-hosted example. The install guide does not prescribe that port. In that guide, `127.0.0.1:8080` is an old CLI default, not the hosted API.
+
+If either variable is missing, preflight exits before Harbor queues the trial.
+
+### The image has to exist first
+
+`harbor run` does not build the image. The image must already be in that Rayrun environment. The name is in [Image name](#image-name) below.
+
+Hosted Rayrun: build with `POST /v1/builds`. The call returns **202**. Poll `GET /v1/builds/{id}` and read `image_ref`. Do not upload a local `rootfs.ext4` or an image directory. The public API has no upload for that file. The request is in [Build an image on hosted Rayrun](#build-an-image-on-hosted-rayrun), and the field list is on [镜像与构建](https://rayrunos.com/docs/api/images/).
+
+Self-hosted Rayrun: the [Harbor guide](https://rayrunos.com/docs/integrations/harbor/) says to use `images/build-task-image.sh` from the Rayrun platform tree (the private RayrunOS/RayrunOS repository), on a machine that has Docker. That page does not list the script's flags. If the image is missing, this provider prints a command. Copy that command. It passes `--root-writable`. Do not add the older `--writable-dir /logs`, `--writable-dir /tests`, and `--writable-dir /solution`.
+
+The Harbor guide still says Rayrun does not build images, and that hosted users should mail [support@rayrunos.com](mailto:support@rayrunos.com) to have an image prepared. The API reference documents building a Dockerfile yourself with `POST /v1/builds`. Follow the API reference for the request.
+
+### Start the trial
 
 ```bash
 harbor run -t <task> -a oracle -e harbor_rayrun:RayrunEnvironment
 ```
 
-本地任务目录用 `-p <任务目录>`，registry 上的单个任务用 `-t <org/name>`。`-a oracle`
-跑的是任务自带的参考解。非交互再加 `-y`。
+- `-t <task>` selects a registry task, such as `org/name`.
+- `-p <task-dir>` selects a task directory on your machine. The Harbor guide uses `-p`.
+- `-a oracle` runs the task's reference solution (`solution/solve.sh`). It does not call a model.
+- `-y` skips the confirmation prompt.
+- `-e harbor_rayrun:RayrunEnvironment` loads this provider.
 
-镜像名是 `<RAYRUN_IMAGE_PREFIX><任务目录名>@<RAYRUN_IMAGE_VERSION>`。两个变量都不设时，
-前缀为空、版本为 `1`，例如任务目录 `regex-log` 对应镜像 `regex-log@1`。
+A local task, with no prompt:
 
 ```bash
-export RAYRUN_IMAGE_PREFIX=tb-    # 可选
-export RAYRUN_IMAGE_VERSION=1     # 可选，默认 1
+harbor run -p ./my-task -a oracle -y -e harbor_rayrun:RayrunEnvironment
 ```
 
-名字对不上时，`start()` 会报错并列出当前环境里已有的镜像。
+In a job config, set `environment.import_path` to the same `harbor_rayrun:RayrunEnvironment` string.
 
-## 镜像
+### Image name
 
-镜像要先存在于目标 Rayrun 环境。`start()` 用 `GET /v1/agents` 核对，缺失就报错，不静默换镜像。
+The provider looks up this name:
 
-### 托管：平台 builder
+```text
+<RAYRUN_IMAGE_PREFIX><task-dir>@<RAYRUN_IMAGE_VERSION>
+```
 
-用 `POST /v1/builds` 在平台上构建。请求返回 **202**，再轮询 `GET /v1/builds/{id}`，
-直到 `status` 为 `succeeded`。成功结果里的 `image_ref`（形如 `regex-log@1`）就是
-provider 要的镜像名；若版本不是 `1`，把 `RAYRUN_IMAGE_VERSION` 设成这个版本号。
+The prefix defaults to empty. The version defaults to `1`. A task directory named `regex-log` needs an image named `regex-log@1`.
 
-平台 builder 默认把镜像标成整根可写（Harbor 的 `/logs`、`/tests`、`/solution` 需要可写）。
-**不要**把本地的 `rootfs.ext4` 或镜像目录传到托管环境。
+```bash
+export RAYRUN_IMAGE_PREFIX=tb-   # optional
+export RAYRUN_IMAGE_VERSION=1    # optional, default 1
+```
 
-只有 Dockerfile 文本时用 JSON。`COPY` 需要构建上下文时改用 `multipart/form-data`，
-并带上 `context.tar.gz`。
+`<task-dir>` is the task directory name. Harbor passes that name in as the environment name. If `GET /v1/agents` does not list the image, `start()` stops and prints the images that do exist. It does not pick a different one. The list endpoint is on [镜像与构建](https://rayrunos.com/docs/api/images/).
+
+## Details you can skip the first time
+
+### Build an image on hosted Rayrun
+
+`POST /v1/builds` is asynchronous. **202** means the job was accepted and `status` is `pending` (queued or already running). The server checks the Dockerfile, prepares `FROM`, merges egress, and stores the build context before it returns that 202.
+
+Poll the job:
+
+```bash
+curl -sS -H "Authorization: Bearer $RAYRUN_TOKEN" \
+  "$RAYRUN_API_URL/builds/<id>"
+```
+
+The body has `status`, `failure_reason`, and `image_ref`. Use `image_ref` as the image name this provider looks up. If it is not `<task-dir>@1`, set `RAYRUN_IMAGE_PREFIX` and `RAYRUN_IMAGE_VERSION` to match. What each `status` means is on the API page, under 单个构建作业: [镜像与构建](https://rayrunos.com/docs/api/images/).
+
+`name` is required. It may contain only lowercase letters, digits, and `.` `_` `-`, and it is at most 64 characters. `dockerfile` is the Dockerfile text, at most 256 KiB. `FROM` must be a public registry image. `FROM` a Rayrun image returns 400 `unsupported_base`.
+
+Send JSON when you only have the Dockerfile text. If the Dockerfile `COPY`s files, send `multipart/form-data` and include `context.tar.gz`. In that form, `egress` and `build_args` are JSON strings.
 
 ```bash
 curl -sS -X POST \
   -H "Authorization: Bearer $RAYRUN_TOKEN" \
   -H 'Content-Type: application/json' \
-  -d '{"name":"regex-log",
-       "dockerfile":"FROM ghcr.io/laude-institute/terminal-bench/regex-log:2.0\nRUN true",
-       "egress":{"allow":["ghcr.io"]}}' \
+  -d '{"name":"regex-log","dockerfile":"FROM public.example/image:tag\nRUN true","egress":{"allow":["public.example"]}}' \
   "$RAYRUN_API_URL/builds"
 ```
 
-`name` 只含小写字母、数字和 `.` `_` `-`，最长 64。`egress.allow` 列出构建期要访问的
-域名（基础镜像的 registry、apt / pip 源等）；基础镜像的 registry 会由服务端并入白名单。
-构建期出网和 trial 出网是两套策略：trial 仍按下一节的 Harbor `NetworkPolicy` 映射。
+`egress` on this call is optional. The object is documented with the sandbox API: `allow`, `deny`, `allow_all`, and `bandwidth_mbps`. See [沙箱](https://rayrunos.com/docs/api/sandboxes/). Build-time egress is not the trial's network policy. The trial still uses the table below.
 
-跑完可删：`DELETE /v1/images/<name>@<version>`。
+`$RAYRUN_API_URL` already ends in `/v1`. The path above is `/builds`, not `/v1/builds` a second time.
 
-### 自托管：离线 builder
+To delete an image you built: `DELETE /v1/images/{ref}`. Take `ref` from `GET /v1/images`.
 
-自托管者使用 Rayrun 平台树里的 `images/build-task-image.sh`（仓库
-[RayrunOS/RayrunOS](https://github.com/RayrunOS/RayrunOS)，在有 docker 的机器上执行）。
-**`--root-writable` 必需。** 以前那三个 `--writable-dir /logs`、`--writable-dir /tests`、
-`--writable-dir /solution` 已经废弃，不要再加。
+### Build an image for a self-hosted Rayrun
+
+The [Harbor guide](https://rayrunos.com/docs/integrations/harbor/) names `images/build-task-image.sh` in the Rayrun platform tree and does not list its flags. The tree is the private RayrunOS/RayrunOS repository. Run the script on a machine with Docker.
+
+When the image is missing, this provider prints a command like the one below. `--root-writable` is there because Harbor has to write `/logs`, `/tests`, and `/solution`:
 
 ```bash
-# 任务只给了 docker_image
-images/build-task-image.sh --image <task.toml 里的 docker_image> \
-    --name <任务目录名> --version 1 --out /tmp/task-images --root-writable
+# task ships environment/Dockerfile
+images/build-task-image.sh --dockerfile <task>/environment/Dockerfile \
+    --name <task-dir> --version 1 --out /tmp/task-images --root-writable
 
-# 任务带有 environment/Dockerfile
-images/build-task-image.sh --dockerfile <任务>/environment/Dockerfile \
-    --name <任务目录名> --version 1 --out /tmp/task-images --root-writable
+# task.toml names a prebuilt image (docker_image)
+images/build-task-image.sh --image <docker_image from task.toml> \
+    --name <task-dir> --version 1 --out /tmp/task-images --root-writable
 ```
 
-产出是 `<out>/<name>@<version>/`。把它放到本机 daemon 的镜像目录 `RAYRUN_IMAGES_DIR`
-（缺省在数据目录下的 `images/`）。这条路只用于自托管，不要把这份目录传到托管环境。
+Put the output where that self-hosted daemon reads images. The error text calls that directory `RAYRUN_IMAGES_DIR`. This path is only for a self-hosted daemon. Do not upload it to hosted Rayrun.
 
-### 为什么必须整根可写
+Do not pass `--writable-dir /logs`, `--writable-dir /tests`, or `--writable-dir /solution`. Those three flags are obsolete. This package does not print them.
 
-沙箱里，清单外的目录默认只读。可写面是固定的几个子树
-（`/usr` `/etc` `/var` `/opt` `/root` `/home` `/srv`）加上 `/workspace`。
-Harbor 的 `/logs`（reward 写在 `/logs/verifier/reward.txt`）、`/tests`、`/solution`
-都在清单外。少了可写面时，verifier 写不出 reward，表面症状只是「reward 文件不存在」。
+### Why `/logs`, `/tests`, and `/solution` must be writable
 
-`--root-writable` 在镜像里写下标记，guestd 用 overlay 加 pivot_root 换根，让 `/` 与
-docker 的语义一致。任务镜像自己的 `WORKDIR`（常见是 `/app`）由 guestd 按 manifest
-的 `[run].workdir` 补挂，不用在命令行再声明。
+Harbor writes the reward to `/logs/verifier/reward.txt`. It uploads tests to `/tests` and the reference solution to `/solution`. If those paths are not writable, the verifier cannot write the reward file. Harbor then only reports that the file is missing.
 
-## 网络策略
+The public builds page does not document a writable-root switch on `POST /v1/builds`. This package's errors, when the image is missing or the sandbox workdir is read-only, tell you to rebuild with a writable root: hosted, with `POST /v1/builds`; self-hosted, with `images/build-task-image.sh --root-writable`.
 
-Harbor 的 `NetworkPolicy` 原样映射到 Rayrun 的 `egress`，不做静默近似。
+### Network policy
 
-| Harbor `network_mode` | Rayrun `egress` |
+Rayrun's own default is no outbound network. The [quickstart](https://rayrunos.com/docs/quickstart/) says the allow list is empty unless you set one. Harbor's default network mode is `public`. This provider does not leave a `public` Harbor task on that no-network default. It maps the task's policy as written. It does not quietly swap one mode for another.
+
+| Harbor `network_mode` | `egress` this provider sends |
 |---|---|
-| `no-network` | `allow: []`（完全断网） |
-| `allowlist` | `allow: [...]`（域名精确匹配，外加 IPv4 CIDR；不做通配，不收裸 IP） |
-| `public`（Harbor 的默认） | `allow_all: true`（显式档位，会记入审计） |
+| `no-network` | `allow: []` (no outbound traffic) |
+| `allowlist` | `allow: [...]` (the hosts the task listed) |
+| `public` (Harbor's default) | `allow_all: true` |
 
-`public` 映射到 `egress.allow_all=true`，所以默认任务可以出网。这台沙箱开了全出网，
-在 Rayrun 的 `sandbox.created` 记录里看得到（`payload.egress.allow_all`）。
+This provider tells Harbor that an allowlist may contain exact hostnames and IPv4 CIDR ranges, and that it does not accept wildcards, bare IP addresses, or IPv6. Rayrun's full `Egress` object also has `deny` and `bandwidth_mbps`. This provider does not set those. The object, including how allow and deny interact, is on the [sandbox API](https://rayrunos.com/docs/api/sandboxes/). Creating a sandbox can also merge the image's recommended allow list. That merge is Rayrun's, not an extra step in this package.
 
-## 依赖
+Egress is set once, when the sandbox is created. Rayrun can replace it later with `PUT /v1/sandboxes/{id}/egress`. This provider does not call that endpoint (`dynamic_network_policy` is false).
 
-- 运行时：`harbor>=0.26,<0.27`（`BaseEnvironment`）与 `httpx`。安装本包时会带上。
-  刻意不依赖 Rayrun 的生成式 SDK：provider 只用沙箱、exec、文件和镜像列表这几条端点。
-- 开发与测试：`pytest`、`pytest-asyncio`（`[project.optional-dependencies]` 的 `test`）。
+## What has been checked
 
-Harbor 0.26 起，自定义环境必须继承 `BaseEnvironment`；`preflight` 覆写要接受
-`kwargs=None` 并调用 `super().preflight(kwargs)`。本包已按这个契约实现。
-能力位按已安装的 Harbor 0.26 `EnvironmentCapabilities` 声明，其中 `stream=False`
-（不提供 SSH 执行和 TCP 转发）。
-
-## 测试
+Unit tests mock the HTTP client (`httpx.MockTransport`). They do not call a live Rayrun. They cover the failures that would otherwise pass silently: a capability this provider does not have, `public` turned into no network, a missing image with no command you can copy, a timeout with no exit code Harbor can read, and a file write that does not create the parent directory.
 
 ```bash
-make test        # 首次会建 .venv 并安装依赖（需要网络）
+make test
 ```
 
-单测用 `httpx.MockTransport` 打桩，不打真网络。覆盖的是会静默出错的判断：能力虚报、
-`public` 被降级成断网、镜像缺失没有可操作提示、超时没有可判定退出码、写文件不建父目录。
+The first run creates a `.venv` and installs dependencies. It needs a network path to a package index.
 
-## 已知范围
-
-单测钉的是 provider 自己的判断。端到端只在 **oracle、样本任务** 上对过：参考解能跑完
-并写出 reward，说明建沙箱、传文件、exec、出网和回传 `/logs` 这条链是通的。
-这不是「真实 agent 已可用」，也不是「完整 terminal-bench 已通过」。
+End-to-end runs so far are oracle on sample tasks only. That is not a real-agent result, and it is not a full terminal-bench pass. Rayrun's Harbor guide describes an oracle reward of 1.0 as the check that a reference solution finished. This repository does not report that score as a result.
