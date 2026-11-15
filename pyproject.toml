@@ -1,6 +1,6 @@
 [project]
 name = "harbor-rayrun"
-version = "0.1.1"
+version = "0.1.2"
 description = "Harbor provider：把 Rayrun 沙箱云接成 Harbor 的评测环境"
 readme = "README.md"
 license = { text = "Apache-2.0" }
