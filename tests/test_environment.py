@@ -169,6 +169,7 @@ def test_capabilities_are_honest(tmp_path, monkeypatch):
     env = make_env(tmp_path, monkeypatch, Recorder())
     caps = env.capabilities
 
+    assert caps.stream is False                         # 无 SSH / TCP 转发（Harbor 0.26）
     assert caps.disable_internet is True            # egress.allow=[] 即断网
     assert caps.network_allowlist is True
     assert caps.network_allowlist_hostnames is True
@@ -180,6 +181,27 @@ def test_capabilities_are_honest(tmp_path, monkeypatch):
     assert caps.docker_compose is False
     assert caps.gpus is False and caps.tpus is False and caps.windows is False
     assert caps.mounted is False
+
+
+def test_preflight_requires_credentials(monkeypatch):
+    """Harbor 0.26：preflight(kwargs=None) 先走基类，再拦缺失的凭证。"""
+    monkeypatch.delenv("RAYRUN_API_URL", raising=False)
+    monkeypatch.delenv("RAYRUN_TOKEN", raising=False)
+
+    with pytest.raises(SystemExit) as exc:
+        RayrunEnvironment.preflight(None)
+
+    message = str(exc.value)
+    assert "RAYRUN_API_URL" in message
+    assert "RAYRUN_TOKEN" in message
+    assert "api.rayrunos.com/v1" in message
+
+
+def test_preflight_accepts_kwargs_when_credentials_present(monkeypatch):
+    monkeypatch.setenv("RAYRUN_API_URL", BASE)
+    monkeypatch.setenv("RAYRUN_TOKEN", "rayrun_test_secret")
+
+    RayrunEnvironment.preflight({})
 
 
 def test_type_is_rayrun(tmp_path, monkeypatch):
@@ -244,7 +266,7 @@ async def test_allowlist_is_sorted_and_deduped(tmp_path, monkeypatch):
 # ---------------------------------------------------------------- 镜像
 @pytest.mark.asyncio
 async def test_missing_image_error_is_actionable(tmp_path, monkeypatch):
-    """镜像缺失要给「能直接照做」的构建命令（Rayrun 不做镜像构建，M3.5）。"""
+    """镜像缺失要给出托管平台 builder 和自托管 --root-writable 命令。"""
     rec = Recorder({("GET", "/v1/agents"): httpx.Response(200, json={"agents": []})})
     env = make_env(tmp_path, monkeypatch, rec, network_policy=allowlist(["pypi.org"]))
 
@@ -254,7 +276,10 @@ async def test_missing_image_error_is_actionable(tmp_path, monkeypatch):
     message = str(exc.value)
     assert "build-task-image.sh" in message
     assert "--name hello-world" in message
-    assert "rsync" in message
+    assert "--root-writable" in message
+    assert "POST /v1/builds" in message
+    assert "rsync" not in message
+    assert "--writable-dir" not in message
 
 
 @pytest.mark.asyncio
@@ -496,9 +521,8 @@ async def test_relative_paths_pass_through_unchanged(tmp_path, monkeypatch):
 async def test_readonly_workdir_error_is_actionable(tmp_path, monkeypatch):
     """workdir 只读/不存在时，报错必须指向可照做的修法。
 
-    这正是 M4 首轮踩到的坑（`harbor-integration.md` §13.3）：镜像的 workdir
-    不在可写子树里，写文件只会以 io_error/EROFS 失败，而那个报错完全指不出
-    原因。探测放在第一次用到文件 API 时（pwd 与可写性同一趟）。
+    镜像的 workdir 不在可写子树里时，写文件只会以 io_error/EROFS 失败，
+    而那个报错指不出原因。探测放在第一次用到文件 API 时（pwd 与可写性同一趟）。
     """
     rec = Recorder(root_error="touch: cannot touch '.rayrun-writecheck': Read-only file system")
     env = make_env(tmp_path, monkeypatch, rec)
@@ -510,8 +534,10 @@ async def test_readonly_workdir_error_is_actionable(tmp_path, monkeypatch):
         await env.upload_file(local, "/logs/f.txt")
 
     message = str(exc.value)
-    assert "--writable-dir" in message
+    assert "--root-writable" in message
+    assert "--writable-dir" not in message
     assert "Read-only file system" in message
+    assert "POST /v1/builds" in message
 
 
 @pytest.mark.asyncio
