@@ -16,8 +16,8 @@ trial 的隔离环境由 provider 实现，本包把它落到 Rayrun 的 HTTP AP
 | `download_file` / `download_dir` | `GET …/files/{path}`；列目录是**单层**的，provider 自己走递归 |
 | `is_dir` / `is_file` | 用基类默认实现（走 `exec` 的 `test -d/-f`），不覆写 |
 
-**它不负责什么**：不构建镜像（Rayrun 不做镜像构建，见下）、不做 SSH/流式（`stream` 档位未开）、
-不支持 GPU / TPU / Windows / docker-compose。
+**它不负责什么**：不构建镜像（镜像由平台 builder `POST /v1/builds` 或离线 builder 产出，见下）、
+不做 SSH/流式（`stream` 档位未开）、不支持 GPU / TPU / Windows / docker-compose。
 
 ## 用法
 
@@ -41,26 +41,30 @@ harbor run -t <task> -a oracle -e harbor_rayrun:RayrunEnvironment
 
 ## 两条必须先知道的前提
 
-**1. 镜像要先在 Rayrun 宿主机上备好。** Rayrun 的镜像是**离线 builder** 的产物
-（`images/build-task-image.sh`，见 `docs/plans/harbor-integration.md` §10）—— 容器内构建
-Dockerfile 是明确不做的（RCE 面）。镜像缺失时 `start()` 会直接报错并附一条**可直接复制**的
-构建命令，不猜、不静默。
+**1. 镜像要先在目标 Rayrun 环境里备好。** 两条路：
 
-**构建时必须带上三个 `--writable-dir`**：
+- **线上/托管**：用平台 builder 现场构建（`POST /v1/builds`，ADR-024），产物是
+  `<name>@<version>`，跑完删除。**不要把本地 `rootfs.ext4` / 镜像目录传到线上**
+  （`docs/howto/harbor-on-rayrun.md` §1.2；CLAUDE.md §6）。
+- **本地 dev**：用离线 builder `images/build-task-image.sh` 产出到本机
+  `RAYRUN_IMAGES_DIR`，见 `docs/plans/harbor-integration.md` §10。
+
+镜像缺失时 `start()` 会直接报错并附一条**可直接复制**的构建命令，不猜、不静默。
+
+**构建时带 `--root-writable`**（旧的「三个 `--writable-dir`」方案已被它取代）：
 
 ```bash
 images/build-task-image.sh --dockerfile <任务的 Dockerfile> \
-    --name <name> --version 1 --out /tmp/task-images \
-    --writable-dir /logs --writable-dir /tests --writable-dir /solution
+    --name <name> --version 1 --out /tmp/task-images --root-writable
 ```
 
 这不是可选优化。沙箱里**清单外的目录一律只读**（ADR-006：可写面是固定 7 个子树
 `/usr /etc /var /opt /root /home /srv` + `/workspace` 盘），而 Harbor 的
-`/logs`（reward 写在这里）`/tests` `/solution` 全在清单外 ⇒ 少了它们，verifier 连
-`/logs/verifier/reward.txt` 都写不出来，症状只是「reward 文件不存在」。同一原因，
-任务镜像自己的 `WORKDIR`（典型 `/app`）也要可写 —— 那一条由 guestd 按 manifest 的
-`[run].workdir` **自动**补挂，不需要在命令行重复声明。见 `docs/plans/harbor-integration.md`
-§13.3 与 ADR-006 修订。
+`/logs`（reward 写在这里）`/tests` `/solution` 全在清单外 ⇒ 少了可写面，verifier 连
+`/logs/verifier/reward.txt` 都写不出来，症状只是「reward 文件不存在」。`--root-writable`
+用 overlay + pivot_root 让 `/` 与 docker 语义一致；任务镜像自己的 `WORKDIR`（典型 `/app`）
+也由 guestd 按 manifest 的 `[run].workdir` 自动补挂。见 `docs/plans/harbor-integration.md`
+§13.3 / §13.11 与 ADR-006 修订。
 
 **2. 网络策略的映射是精确的**（2026-09-27 起）：
 
