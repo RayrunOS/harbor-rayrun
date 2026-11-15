@@ -26,7 +26,8 @@ trial 的隔离环境由 provider 实现，本包把它落到 Rayrun 的 HTTP AP
 
 ```bash
 # 1. 装（Harbor 与 provider 在同一个 Python 环境里）
-uv pip install git+ssh://git@github.com/RayrunOS/harbor-rayrun.git
+uv pip install harbor-rayrun
+# 或从源码：uv pip install git+ssh://git@github.com/RayrunOS/harbor-rayrun.git
 # 或在本仓库根目录：uv pip install .
 
 # 2. 凭证（沿用 CLI 的 env 名，docs/07 §2.5）
